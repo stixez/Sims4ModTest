@@ -82,7 +82,7 @@ class CheckFailed(Exception):
     """GitHub couldn't be asked: offline, rate limited, a private repo, or a broken answer."""
 
 
-def find_update(skipped: str = "", timeout: float = 8.0) -> Release | None:
+def find_update(skipped: str = "", timeout: float = 5.0) -> Release | None:
     """A release newer than this one that the user hasn't said "not now" to, or None if there
     is none. Raises CheckFailed when it can't tell."""
     request = urllib.request.Request(LATEST_API, headers={
@@ -100,7 +100,7 @@ def find_update(skipped: str = "", timeout: float = 8.0) -> Release | None:
     return release
 
 
-def available_update(skipped: str = "", timeout: float = 8.0) -> Release | None:
+def available_update(skipped: str = "", timeout: float = 5.0) -> Release | None:
     """Like find_update, but silent when GitHub can't be asked: the next day tries again."""
     try:
         return find_update(skipped, timeout)

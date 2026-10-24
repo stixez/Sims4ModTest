@@ -830,6 +830,7 @@ class MainWindow(QWidget):
         self.state: dict | None = None
         self.reports: list[Path] = []
         self.game_keys: frozenset[int] | None = None
+        self.closing = False  # set when the window closes: no new background work after that
         self.risk_cache: dict[tuple, list[str]] = {}     # (path, size, mtime, with game index) -> warnings
         self.suspect_cache: dict[tuple, list[str]] = {}  # (report, mtime) -> mods it mentions
 
@@ -1468,6 +1469,8 @@ class MainWindow(QWidget):
     def run_side(self, worker: Worker, on_ok, touches_sims: bool = False, on_fail=None) -> None:
         """A read-only job (counting, checking); its errors are not worth interrupting for,
         unless the caller asks to hear about them."""
+        if self.closing:
+            return  # e.g. the update check's timer firing while the window closes
         worker.touches_sims = touches_sims
         self.side_jobs.append(worker)
         worker.succeeded.connect(on_ok)
@@ -1609,12 +1612,19 @@ class MainWindow(QWidget):
         if self.busy():
             e.ignore()  # never leave a swap half done
             return
-        self.watcher.requestInterruption()
-        self.watcher.wait(3000)
-        for job in list(self.side_jobs):  # read-only work: ask it to stop, never kill a Python thread
-            job.requestInterruption()
-            job.wait(1000)
+        # Gone for the user right away; the read-only checks get a few seconds to end by themselves
+        # (each one stops when asked, and the update check gives up after a few seconds).
+        self.closing = True
+        self.hide()
+        threads = [self.watcher, *self.side_jobs]
+        for t in threads:
+            t.requestInterruption()
+        deadline = time.monotonic() + 8
+        for t in threads:
+            t.wait(max(0, int((deadline - time.monotonic()) * 1000)))
         super().closeEvent(e)
+        # Hidden above, so Qt may not count this as the last window closing: end the loop ourselves.
+        QApplication.instance().quit()
 
 
 def _ctime(path: Path) -> float:
@@ -1654,12 +1664,25 @@ def main() -> int:
         QTimer.singleShot(3000, win.close)
     code = app.exec()
     if win.watcher.isRunning() or any(job.isRunning() for job in win.side_jobs):
+        # A read-only check is still stuck (a very slow network). Python would wait for it or abort
+        # over a running QThread, and nothing it does needs saving, so leave now.
         win.settings.sync()
         lock.unlock()
-        # A read-only check (game index, update check) is still finishing. Python would wait for it
-        # or abort over a running QThread; nothing it does needs saving, so leave right away.
-        os._exit(code)
+        _leave_now(code)
     return code
+
+
+def _leave_now(code: int) -> None:
+    """End the process at once. On Windows without DLL clean-up: os._exit runs it and can crash
+    while another thread is inside a system library (seen with the certificate store)."""
+    if platforms.WINDOWS:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32")
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE  # a 64-bit handle, not ctypes' default int
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code)
+    os._exit(code)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
-"""Folder swapping for Mod Tester. No Qt in here, so it can be tested on its own.
+"""Folder swapping for Sims 4 Mod Test. No Qt in here, so it can be tested on its own.
 
 A test works like this, for Mods and (when the test has tray files) for Tray:
   1. the chosen files are copied into a staging folder next to the live one,
   2. the live folder is renamed to its backup name,
   3. the staging folder is renamed to the live name.
 Ending a test renames the live folder to a "finished" name, the backup back to
-the live name, and sends the finished folder to the Recycle Bin. The Mods backup
+the live name, and sends the finished folder to the Recycle Bin (Trash). The Mods backup
 existing is what "a test is running" means, so the app survives being closed or
 crashing in the middle.
 
@@ -14,7 +14,7 @@ hard links to half of the user's own mods (no copying, no extra disk space).
 """
 from __future__ import annotations
 
-import ctypes
+import errno
 import hashlib
 import json
 import math
@@ -24,12 +24,14 @@ import tempfile
 import time
 import zipfile
 import zlib
-from ctypes import wintypes
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterator
 
 import psutil
+
+import platforms
+from platforms import GAME_PROCESSES, long_path, recycle
 
 
 @dataclass(frozen=True)
@@ -40,13 +42,12 @@ class Slot:
     finished: str
 
 
-MODS = Slot("Mods", "Mods (your mods, set aside by Mod Tester)",
-            "Mods (Mod Tester, preparing)", "Mods (finished Mod Tester test)")
-TRAY = Slot("Tray", "Tray (your tray, set aside by Mod Tester)",
-            "Tray (Mod Tester, preparing)", "Tray (finished Mod Tester test)")
+MODS = Slot("Mods", "Mods (your mods, set aside by Sims 4 Mod Test)",
+            "Mods (Sims 4 Mod Test, preparing)", "Mods (test copies, Sims 4 Mod Test)")
+TRAY = Slot("Tray", "Tray (your tray, set aside by Sims 4 Mod Test)",
+            "Tray (Sims 4 Mod Test, preparing)", "Tray (test copies, Sims 4 Mod Test)")
 SLOTS = (MODS, TRAY)
 
-GAME_PROCESSES = {"ts4_x64.exe", "ts4.exe", "ts4_dx9_x64.exe", "ts4_x64_fpb.exe"}
 MOD_EXTENSIONS = {".package", ".ts4script"}
 TRAY_EXTENSIONS = {".trayitem", ".householdbinary", ".hhi", ".sgi", ".blueprint", ".bpi", ".room", ".rmi"}
 JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
@@ -64,12 +65,11 @@ DEFAULT_RESOURCE_CFG = (
     "PackedFile */*/*/*/*/*.package\n"
 )
 
-DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Mod Tester"
+DATA_DIR = platforms.data_dir()
 STATE_PATH = DATA_DIR / "state.json"
 SAVE_BACKUP_DIR = DATA_DIR / "save backup"
-REMOVED_NAME = "Mods removed by Mod Tester"
+REMOVED_NAME = "Mods removed by Sims 4 Mod Test"
 
-_LONG_PREFIX = "\\\\?\\"
 # What zipfile raises for damaged data, Deflate64 (big zips made by Windows) and passwords.
 ZIP_ERRORS = (zipfile.BadZipFile, zipfile.LargeZipFile, NotImplementedError, RuntimeError, EOFError, zlib.error)
 
@@ -80,12 +80,15 @@ class TesterError(Exception):
 
 # ---------------------------------------------------------------- Sims folder
 
-def find_sims_dirs(documents: Path) -> list[Path]:
-    """Sims 4 user folders under Documents\\Electronic Arts (the name is localised)."""
-    ea = documents / "Electronic Arts"
-    if not ea.is_dir():
-        return []
-    found = [d for d in ea.iterdir() if d.is_dir() and looks_like_sims_dir(d)]
+def find_sims_dirs(documents: list[Path]) -> list[Path]:
+    """Sims 4 user folders under <Documents>/Electronic Arts (the name is localised)."""
+    found: list[Path] = []
+    for docs in documents:
+        ea = docs / "Electronic Arts"
+        try:
+            found += [d for d in ea.iterdir() if d.is_dir() and looks_like_sims_dir(d) and d not in found]
+        except OSError:  # missing, denied, or an offline OneDrive folder
+            continue
     # Prefer the English name, then whichever was played most recently.
     found.sort(key=lambda d: (d.name != "The Sims 4", -mtime(d / "Options.ini")))
     return found
@@ -273,11 +276,11 @@ def _inspect_one(path: Path) -> ModItem:
         except zipfile.BadZipFile:
             raise TesterError(f"\u201c{path.name}\u201d is damaged or not a real .zip file.")
         except (NotImplementedError, RuntimeError):
-            raise TesterError(f"\u201c{path.name}\u201d is packed in a way Mod Tester can\u2019t open, or has a "
+            raise TesterError(f"\u201c{path.name}\u201d is packed in a way Sims 4 Mod Test can\u2019t open, or has a "
                               "password. Unpack it in Windows first, then add what was inside.")
     if ext in {".rar", ".7z"}:
         raise TesterError(f"Unpack \u201c{path.name}\u201d first, then add what was inside. "
-                          "Mod Tester can only open .zip files.")
+                          "Sims 4 Mod Test can only open .zip files.")
     raise TesterError(f"\u201c{path.name}\u201d is not a mod or tray file.")
 
 
@@ -404,17 +407,6 @@ def _zip_members(zf: zipfile.ZipFile) -> Iterator[zipfile.ZipInfo]:
         yield info
 
 
-def long_path(path: Path | str) -> str:
-    """Windows path that may go past 260 characters (long CC names are common)."""
-    s = str(path)
-    if s.startswith(_LONG_PREFIX):
-        return s
-    s = os.path.abspath(s)
-    if s.startswith("\\\\"):  # network share: \\server\share -> \\?\UNC\server\share
-        return _LONG_PREFIX + "UNC\\" + s[2:]
-    return _LONG_PREFIX + s
-
-
 _RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 _BAD_CHARS = set('<>:"/\\|?*') | {chr(c) for c in range(32)}
 
@@ -519,7 +511,40 @@ def _save_state(state: dict | None, required: bool = False) -> None:
             os.replace(tmp, STATE_PATH)
     except OSError as e:
         if required:
-            raise TesterError(f"Mod Tester could not save its progress ({reason(e)}). Nothing was changed.")
+            raise TesterError(f"Sims 4 Mod Test could not save its progress ({reason(e)}). Nothing was changed.")
+
+
+_OLD_NAMES = {  # folder names used before the app was renamed to Sims 4 Mod Test
+    "Mods (your mods, set aside by Mod Tester)": MODS.backup,
+    "Tray (your tray, set aside by Mod Tester)": TRAY.backup,
+    "Mods (Mod Tester, preparing)": MODS.staging,
+    "Tray (Mod Tester, preparing)": TRAY.staging,
+    "Mods (finished Mod Tester test)": MODS.finished,
+    "Tray (finished Mod Tester test)": TRAY.finished,
+    "Mods removed by Mod Tester": REMOVED_NAME,
+}
+
+
+def migrate_data_dir() -> None:
+    """Move the old app's data folder (state of a running test, save backups) to the new name.
+    Runs before anything else creates the new folder."""
+    old_data = DATA_DIR.parent / "Mod Tester"
+    if old_data.is_dir() and not DATA_DIR.exists():
+        try:
+            os.rename(old_data, DATA_DIR)
+        except OSError:
+            pass
+
+
+def _migrate_old_names(sims_dir: Path) -> None:
+    for old, new in _OLD_NAMES.items():
+        if (sims_dir / old).is_dir() and not (sims_dir / new).exists():
+            _rename(sims_dir / old, sims_dir / new)
+    for slot in SLOTS:  # numbered leftovers: "Mods (finished Mod Tester test 2)"
+        for old in sims_dir.glob(f"{slot.live} (finished Mod Tester test *)"):
+            if old.is_dir():
+                _rename(old, _finished_target(sims_dir, slot))
+    migrate_data_dir()
 
 
 def recover(sims_dir: Path) -> None:
@@ -527,6 +552,7 @@ def recover(sims_dir: Path) -> None:
 
     Whenever a backup exists but its live folder doesn't, the user's own folder goes back.
     """
+    _migrate_old_names(sims_dir)
     for slot in SLOTS:
         live, backup, staging = sims_dir / slot.live, sims_dir / slot.backup, sims_dir / slot.staging
         if backup.is_dir() and not live.exists():
@@ -544,18 +570,18 @@ def recover(sims_dir: Path) -> None:
 
 def finished_folders(sims_dir: Path, slot: Slot = MODS) -> list[Path]:
     """Test folders from earlier tests that are still there (the Recycle Bin refused them)."""
-    stem = slot.finished[:-1]  # "Mods (finished Mod Tester test" matches "... test)" and "... test 2)"
-    return sorted(p for p in sims_dir.glob(_glob_escape(stem) + "*)") if p.is_dir())
+    stem = slot.finished[:-1]  # "Mods (finished Sims 4 Mod Test test" matches "... test)" and "... test 2)"
+    return sorted(p for p in sims_dir.glob(glob_escape(stem) + "*)") if p.is_dir())
 
 
-def _glob_escape(text: str) -> str:
+def glob_escape(text: str) -> str:
     return "".join(f"[{c}]" if c in "[]*?" else c for c in text)
 
 
 # ---------------------------------------------------------------- swapping
 
 def _locked(folder: str) -> TesterError:
-    return TesterError(f"Windows would not let Mod Tester rename the {folder} folder. A program is still "
+    return TesterError(f"Windows would not let Sims 4 Mod Test rename the {folder} folder. A program is still "
                        "using a file in it, for example Sims 4 Studio or a folder window. Close it and try again.")
 
 
@@ -621,7 +647,7 @@ def _swap_out(sims: Path, slot: Slot) -> Path | None:
                 _rename(moved_to, live)
             except OSError:
                 pass  # live is missing and the backup is intact: recover() puts it back
-        raise TesterError(f"Windows would not let Mod Tester move your own {slot.live} folder back. "
+        raise TesterError(f"Windows would not let Sims 4 Mod Test move your own {slot.live} folder back. "
                           f"A program is still using a file in \u201c{slot.backup}\u201d. Close it and try again.")
     return moved_to
 
@@ -805,7 +831,7 @@ def unit_label(unit: list[str]) -> tuple[str, str]:
     """(title, where) for showing a unit: a file name and its folder, or a script mod folder."""
     if len(unit) == 1:
         p = Path(unit[0])
-        return p.name, ("in Mods" if str(p.parent) == "." else f"in Mods\\{p.parent}")
+        return p.name, ("in Mods" if str(p.parent) == "." else f"in {Path('Mods') / p.parent}")
     return Path(os.path.commonpath(unit)).name, f"Script mod folder with {len(unit)} files"
 
 
@@ -855,7 +881,7 @@ def answer_search(sims_dir: Path, still_broken: bool, clear_cache: bool) -> dict
         return state
     units = state["units"]
     if not _round_intact(sims_dir / "Mods", units, state["testing"]):
-        raise TesterError("The Mods folder changed during the search, so Mod Tester lost track of this round. "
+        raise TesterError("The Mods folder changed during the search, so Sims 4 Mod Test lost track of this round. "
                           "Restore your mods and start the search again.")
     new = dict(state)
     if state["round"] == 0:
@@ -947,11 +973,13 @@ def _build_round(source: Path, staging: Path, units: list[list[str]], testing: l
                     made.add(dest.parent)
                 os.link(long_path(source / rel), long_path(dest))
     except OSError as e:
-        if getattr(e, "winerror", None) in (1, 17, 50):  # not supported / different drive
-            raise TesterError("Mod Tester can’t search on this drive. The search needs your Sims 4 "
-                              "folder on a normal Windows (NTFS) drive.")
+        if getattr(e, "winerror", None) in (1, 17, 50) or e.errno in (errno.EXDEV, errno.EPERM, errno.ENOTSUP,
+                                                                       errno.EMLINK):
+            raise TesterError("Sims 4 Mod Test can\u2019t search on this drive, because it can\u2019t make hard "
+                              "links there. The search needs your Sims 4 folder on a normal drive "
+                              "(NTFS on Windows, APFS on a Mac, ext4 or Btrfs on Linux).")
         if isinstance(e, FileNotFoundError):
-            raise TesterError("A mod file disappeared while Mod Tester was setting up the round. "
+            raise TesterError("A mod file disappeared while Sims 4 Mod Test was setting up the round. "
                               "Your mods were not changed. Try again.")
         raise
 
@@ -1089,7 +1117,7 @@ def restore_saves(sims_dir: Path, names: list[str]) -> None:
         if dest.exists():
             if not recycle(dest) or dest.exists():
                 tmp.unlink(missing_ok=True)
-                raise TesterError(f"“{dest.stem}” could not go to the Recycle Bin, so it was left as it "
+                raise TesterError(f"“{dest.stem}” could not go to the {platforms.trash_name()}, so it was left as it "
                                   "is. Close the game and try again.")
         os.replace(tmp, dest)
         _set_pending(sims_dir, [p for p in pending_saves(sims_dir) if p["name"] != name])
@@ -1116,7 +1144,7 @@ def reason(e: Exception) -> str:
     if isinstance(e, (zipfile.BadZipFile, EOFError, zlib.error)):
         return "the .zip file is damaged"
     if isinstance(e, (NotImplementedError, RuntimeError, zipfile.LargeZipFile)):
-        return "it is packed in a way Mod Tester can\u2019t open, or has a password"
+        return "it is packed in a way Sims 4 Mod Test can\u2019t open, or has a password"
     if isinstance(e, OSError) and e.errno == 28:
         return "the disk is full"
     if isinstance(e, PermissionError):
@@ -1124,49 +1152,3 @@ def reason(e: Exception) -> str:
     if isinstance(e, FileNotFoundError):
         return "a file is missing"
     return getattr(e, "strerror", None) or str(e)
-
-
-# ---------------------------------------------------------------- Recycle Bin
-
-class _SHFILEOPSTRUCTW(ctypes.Structure):
-    _fields_ = [
-        ("hwnd", wintypes.HWND),
-        ("wFunc", wintypes.UINT),
-        ("pFrom", wintypes.LPCWSTR),
-        ("pTo", wintypes.LPCWSTR),
-        ("fFlags", ctypes.c_uint16),
-        ("fAnyOperationsAborted", wintypes.BOOL),
-        ("hNameMappings", ctypes.c_void_p),
-        ("lpszProgressTitle", wintypes.LPCWSTR),
-    ]
-
-
-class _SHQUERYRBINFO(ctypes.Structure):
-    _fields_ = [("cbSize", wintypes.DWORD), ("i64Size", ctypes.c_int64), ("i64NumItems", ctypes.c_int64)]
-
-
-def _has_recycle_bin(path: str) -> bool:
-    """Network shares and some removable drives have no Recycle Bin: deleting there is for good."""
-    drive = os.path.splitdrive(path)[0]
-    if not drive or drive.startswith("\\\\"):
-        return False
-    info = _SHQUERYRBINFO(cbSize=ctypes.sizeof(_SHQUERYRBINFO))
-    return ctypes.windll.shell32.SHQueryRecycleBinW(drive + "\\", ctypes.byref(info)) == 0
-
-
-def recycle(path: Path) -> bool:
-    """Send a file or folder to the Recycle Bin. Returns False (and leaves it) if it can't go there.
-
-    If the Recycle Bin is switched off or the item is too big for it, Windows asks first
-    instead of deleting it for good (FOF_WANTNUKEWARNING).
-    """
-    FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_NOERRORUI = 3, 0x4, 0x10, 0x40, 0x400
-    FOF_WANTNUKEWARNING = 0x4000
-    full = os.path.abspath(path)
-    if not _has_recycle_bin(full):
-        return False
-    op = _SHFILEOPSTRUCTW(wFunc=FO_DELETE, pFrom=full + "\0",
-                          fFlags=FOF_SILENT | FOF_NOCONFIRMATION | FOF_ALLOWUNDO | FOF_NOERRORUI
-                          | FOF_WANTNUKEWARNING)
-    result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
-    return result == 0 and not op.fAnyOperationsAborted and not os.path.exists(full)

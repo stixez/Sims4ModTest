@@ -15,7 +15,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core  # noqa: E402
+import platforms  # noqa: E402
 import risks  # noqa: E402
+import updates  # noqa: E402
 
 L = core.long_path
 
@@ -167,14 +169,15 @@ def test_unreadable_zip_inside_a_folder_is_skipped(w):
 def test_zip_names_are_made_safe():
     assert core.safe_name("stream.package:hidden") == "stream.package_hidden"
     assert core.safe_name("..") == "file" and core.safe_name("CON.package") == "_CON.package"
-    assert core.long_path(r"\\server\share\x") == "\\\\?\\UNC\\server\\share\\x"
+    if platforms.WINDOWS:
+        assert core.long_path(r"\\server\share\x") == "\\\\?\\UNC\\server\\share\\x"
 
 
 def test_sims3_folder_is_not_mistaken_for_sims4(w):
     s3 = w.root / "Electronic Arts" / "The Sims 3"
     (s3 / "Mods").mkdir(parents=True)
     (s3 / "Options.ini").write_text("")
-    assert core.find_sims_dirs(w.root) == [w.sims]
+    assert core.find_sims_dirs([w.root]) == [w.sims]
 
 
 # ---------------------------------------------------------------- tests
@@ -249,7 +252,7 @@ def test_leftover_that_recycle_bin_refuses_does_not_block(w, monkeypatch):
     monkeypatch.setattr(core, "recycle", lambda p: None)
     core.start_test(w.sims, w.items()[:1], False)
     result = core.end_test(w.sims, False)
-    assert not core.in_test(w.sims) and [p.name for p in result.leftovers] == ["Mods (finished Mod Tester test 2)"]
+    assert not core.in_test(w.sims) and [p.name for p in result.leftovers] == ["Mods (test copies, Sims 4 Mod Test 2)"]
 
 
 def test_no_mods_or_tray_folder_yet(w):
@@ -302,10 +305,10 @@ def run_search(w, broken: str | None) -> dict:
 
 def test_search_finds_the_broken_mod_and_moves_it_out(w):
     before = inodes(w.mods)
-    culprit = "_CAS\\Hair\\hair7.package"
+    culprit = os.path.join("_CAS", "Hair", "hair7.package")
     units = core.mod_units(w.mods)
     assert len(units) == 12
-    assert ["MCCC\\mc_cas.package", "MCCC\\mc_cmd.ts4script", "MCCC\\mc_settings.cfg"] in units
+    assert [os.path.join("MCCC", n) for n in ("mc_cas.package", "mc_cmd.ts4script", "mc_settings.cfg")] in units
     st = run_search(w, culprit)
     assert st["units"][st["found"]] == [culprit] and st["round"] <= core.rounds_left(12)
     result = core.end_test(w.sims, False, remove_found=True)
@@ -346,8 +349,8 @@ def test_script_mod_rewriting_its_config_does_not_stop_the_search(w):
             tmp = cfg.with_suffix(".tmp")
             tmp.write_text("new settings")
             os.replace(tmp, cfg)
-        st = core.answer_search(w.sims, "MCCC\\mc_cmd.ts4script" in listing(w.mods), False)
-    assert "MCCC\\mc_cmd.ts4script" in st["units"][st["found"]]
+        st = core.answer_search(w.sims, os.path.join("MCCC", "mc_cmd.ts4script") in listing(w.mods), False)
+    assert os.path.join("MCCC", "mc_cmd.ts4script") in st["units"][st["found"]]
     core.end_test(w.sims, False)
 
 
@@ -386,14 +389,61 @@ def test_override_and_old_script_warnings(w):
     (w.dl / "slider.package").write_bytes(dbpf([(0xC5F6763E, 0, 0x1234), (0x034AEECB, 0, 0x99)]))
     game_keys = frozenset({risks._key_int(0xC5F6763E, 0, 0x1234)})
     item = core.inspect_paths([w.dl / "slider.package"], w.sims)[0][0]
-    assert [x.split(".")[0] for x in risks.check(item, game_keys, None)] == ["Changes the game\u2019s own sliders or body shapes"]
+    assert [x.split(".")[0] for x in risks.check(item, game_keys)] == ["Changes the game\u2019s own sliders or body shapes"]
     with zipfile.ZipFile(w.dl / "old.ts4script", "w") as z:
         z.writestr(zipfile.ZipInfo("x.pyc", (2019, 5, 1, 0, 0, 0)), "c")
-    item = core.inspect_paths([w.dl / "old.ts4script"], w.sims)[0][0]
-    assert risks.check(item, None, time.time())[0].startswith("Made before the last game update")
+    assert risks.check(core.inspect_paths([w.dl / "old.ts4script"], w.sims)[0][0], game_keys) == []
+    assert "before the last game update" in risks.outdated_note(w.dl / "old.ts4script", time.time())
+    assert risks.outdated_note(w.dl / "old.ts4script", time.mktime((2018, 1, 1, 0, 0, 0, 0, 0, -1))) == ""
 
 
 def test_error_report_names_the_script(w):
     rep = w.sims / "lastException_1.txt"
     rep.write_text('File "C:\\Users\\x\\Mods\\Tiny\\Tiny_SleepMod.ts4script\\sleep.py", line 3\n', encoding="utf-8")
     assert risks.report_suspects(rep, []) == ["Tiny_SleepMod.ts4script"]
+
+
+# ---------------------------------------------------------------- updates and platforms
+
+def test_update_is_offered_only_when_newer_and_only_from_this_repo():
+    base = f"https://github.com/{updates.REPO}/releases/download/v1.2.0/"
+    data = {"tag_name": "v1.2.0", "html_url": f"https://github.com/{updates.REPO}/releases/tag/v1.2.0",
+            "assets": [{"name": "Sims-4-Mod-Test-1.2.0-setup.exe", "browser_download_url": base + "a-setup.exe"},
+                       {"name": "Sims-4-Mod-Test-1.2.0-macos.zip", "browser_download_url": base + "b-macos.zip"},
+                       {"name": "Sims-4-Mod-Test-1.2.0-linux-x86_64.tar.gz",
+                        "browser_download_url": base + "c-linux-x86_64.tar.gz"}]}
+    assert updates.parse_release(data, "win32").download.endswith("-setup.exe")
+    assert updates.parse_release(data, "darwin").download.endswith("-macos.zip")
+    assert updates.parse_release(data, "linux").download.endswith(".tar.gz")
+    evil = dict(data, assets=[{"name": "x-setup.exe", "browser_download_url": "https://evil.example/x-setup.exe"}])
+    assert updates.parse_release(evil, "win32").download.startswith(f"https://github.com/{updates.REPO}/")
+    assert updates.parse_release(dict(data, draft=True)) is None
+    assert updates.is_newer("1.2.0", "1.0.0") and not updates.is_newer("1.0.0", "1.0.0")
+    assert not updates.is_newer("v0.9", "1.0.0") and updates.parse_version("banana") is None
+
+
+def test_game_folder_is_found_in_a_mac_app_bundle(tmp_path):
+    app = tmp_path / "The Sims 4.app"
+    (app / "Contents" / "Data" / "Client").mkdir(parents=True)
+    assert platforms.game_content_root(app) == app / "Contents"
+    win = tmp_path / "The Sims 4"
+    (win / "Data" / "Client").mkdir(parents=True)
+    assert platforms.game_content_root(win) == win and platforms.game_content_root(tmp_path) is None
+    exe = os.path.join(str(win), "Game", "Bin", "TS4_x64.exe")
+    assert platforms.game_dir_from_process(exe) == win
+
+
+def test_folders_from_the_old_mod_tester_name_are_taken_over(w, tmp_path, monkeypatch):
+    old_backup = w.sims / "Mods (your mods, set aside by Mod Tester)"
+    os.rename(w.mods, old_backup)
+    (w.mods).mkdir()  # the old app's test Mods
+    (w.sims / "Mods (finished Mod Tester test 2)").mkdir()
+    old_data = core.DATA_DIR.parent / "Mod Tester"
+    old_data.mkdir(parents=True)
+    (old_data / "state.json").write_text("{}")
+    core.recover(w.sims)
+    assert core.in_test(w.sims) and (w.sims / core.MODS.backup / "MCCC").is_dir()
+    assert not (w.sims / "Mods (finished Mod Tester test 2)").exists()
+    assert (core.DATA_DIR / "state.json").exists()
+    core.end_test(w.sims, False)
+    assert (w.mods / "MCCC").is_dir()

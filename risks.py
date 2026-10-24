@@ -16,7 +16,6 @@ from __future__ import annotations
 import os
 import re
 import struct
-import winreg
 import zipfile
 from array import array
 from datetime import datetime
@@ -24,6 +23,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 import core
+import platforms
 
 CASP = 0x034AEECB
 SLIDER_TYPES = {0xC5F6763E, 0x0355E0A6, 0xB0118C15}  # SMOD (sim modifier), BOND (bone delta), DMAP
@@ -35,36 +35,14 @@ _COMP_DELETED = 0xFFE0
 
 # ---------------------------------------------------------------- the game install
 
-def game_exe(game_dir: Path) -> Path:
-    return game_dir / "Game" / "Bin" / "TS4_x64.exe"
-
-
-def game_dir_of(exe: Path) -> Path:
-    """C:\\...\\The Sims 4\\Game\\Bin\\TS4_x64.exe -> C:\\...\\The Sims 4"""
-    return exe.parents[2]
-
-
-def find_game_dir() -> Path | None:
-    candidates: list[Path] = []
-    for key in (r"SOFTWARE\Maxis\The Sims 4", r"SOFTWARE\WOW6432Node\Maxis\The Sims 4"):
-        try:
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as k:
-                candidates.append(Path(winreg.QueryValueEx(k, "Install Dir")[0]))
-        except OSError:
-            pass
-    for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
-                 os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
-        candidates += [Path(base) / "EA Games" / "The Sims 4", Path(base) / "Origin Games" / "The Sims 4",
-                       Path(base) / "Steam" / "steamapps" / "common" / "The Sims 4"]
-    return next((c for c in candidates if game_exe(c).is_file()), None)
-
-
 def last_update(game_dir: Path | None, sims_dir: Path | None) -> float | None:
-    """When the game was last updated: the date of its exe, else of GameVersion.txt."""
-    for p in ([game_exe(game_dir)] if game_dir else []) + ([sims_dir / "GameVersion.txt"] if sims_dir else []):
+    """When the game was last updated: the date of its program, else of GameVersion.txt."""
+    candidates = [platforms.game_version_file(game_dir)] if game_dir else []
+    candidates += [sims_dir / "GameVersion.txt"] if sims_dir else []
+    for p in candidates:
         try:
             return p.stat().st_mtime
-        except OSError:
+        except (OSError, AttributeError):
             continue
     return None
 
@@ -144,10 +122,13 @@ def _key_int(t: int, g: int, i: int) -> int:
 
 def game_index(game_dir: Path) -> frozenset[int]:
     """Keys of every CAS part and slider in the game's own packages, cached per game version."""
-    exe = game_exe(game_dir)
-    st = exe.stat()
-    packs = ",".join(sorted(p.name for p in game_dir.iterdir() if p.is_dir() and GAME_FOLDER_RE.match(p.name)))
-    stamp = f"2|{game_dir}|{st.st_size}|{int(st.st_mtime)}|{packs}".encode("utf-8")
+    root = platforms.game_content_root(game_dir)
+    if root is None:
+        return frozenset()
+    version = platforms.game_version_file(game_dir)
+    st = version.stat() if version else root.stat()
+    packs = ",".join(sorted(p.name for p in root.iterdir() if p.is_dir() and GAME_FOLDER_RE.match(p.name)))
+    stamp = f"3|{game_dir}|{st.st_size}|{int(st.st_mtime)}|{packs}".encode("utf-8")
     try:
         data = INDEX_CACHE.read_bytes()
         head, _, body = data.partition(b"\n")
@@ -159,7 +140,7 @@ def game_index(game_dir: Path) -> frozenset[int]:
         pass
 
     keys: set[int] = set()
-    for top in game_dir.iterdir():
+    for top in root.iterdir():
         if not (top.is_dir() and GAME_FOLDER_RE.match(top.name)):
             continue
         for pkg in top.rglob("*.package"):
@@ -190,22 +171,35 @@ def _date(ts: float) -> str:
     return f"{d.day} {d:%b %Y}"
 
 
-def _script_date(fh: BinaryIO) -> float:
-    """Newest file date inside a .ts4script (it is a zip): when the creator built it."""
+def script_built(path: Path) -> float:
+    """Newest file date inside a .ts4script (it is a zip): when the creator built it. 0 if unknown."""
     try:
-        with zipfile.ZipFile(fh) as zf:
+        with open(core.long_path(path), "rb") as fh, zipfile.ZipFile(fh) as zf:
             return max((core.zip_date(i) for i in zf.infolist() if not i.is_dir()), default=0.0)
     except (*core.ZIP_ERRORS, OSError):
         return 0.0
 
 
-def check(item: core.ModItem, game_keys: frozenset[int] | None, updated: float | None) -> list[str]:
-    """Plain-language warnings for one item. Reads its packages' indexes and script dates."""
-    sliders = cas = old_scripts = 0
+def outdated_note(script: Path, updated: float | None) -> str:
+    """'It was made before the last game update (\u2026).' for a script an error report names, else ''.
+
+    Only said next to an error report: plenty of older script mods still work, so on its own
+    the age isn't worth a warning.
+    """
+    built = script_built(script)
+    if updated and built and built < updated - 86400:
+        return f" It was made before the last game update ({_date(updated)}), so look for a newer version."
+    return ""
+
+
+def check(item: core.ModItem, game_keys: frozenset[int] | None) -> list[str]:
+    """Plain-language warnings for one item, from its packages' indexes."""
+    sliders = cas = 0
+    if not game_keys:
+        return []
     try:
         for e in core.entries(item):
-            name = e.name.lower()
-            if name.endswith(".package") and game_keys:
+            if e.name.lower().endswith(".package"):
                 with e.open() as fh:
                     for t, g, i in package_keys(fh, e.size):
                         if _key_int(t, g, i) in game_keys:
@@ -213,11 +207,6 @@ def check(item: core.ModItem, game_keys: frozenset[int] | None, updated: float |
                                 sliders += 1
                             else:
                                 cas += 1
-            elif name.endswith(".ts4script") and updated:
-                with e.open() as fh:
-                    built = _script_date(fh)
-                if built and built < updated - 86400:
-                    old_scripts += 1
     except (OSError, *core.ZIP_ERRORS):
         return []  # unreadable items get their own error when copied
     warnings = []
@@ -226,15 +215,6 @@ def check(item: core.ModItem, game_keys: frozenset[int] | None, updated: float |
                         "Old files like this can give Sims odd heads or bodies.")
     if cas:
         warnings.append(f"Replaces {cas} of the game\u2019s own CAS items (a default replacement).")
-    if old_scripts:
-        if item.kind == "script":
-            what = "Made"
-        elif old_scripts == 1:
-            what = "Has a script mod made"
-        else:
-            what = f"Has {old_scripts} script mods made"
-        warnings.append(f"{what} before the last game update ({_date(updated)}). "
-                        "If something breaks, look for a newer version.")
     return warnings
 
 

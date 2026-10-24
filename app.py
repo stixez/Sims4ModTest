@@ -1,4 +1,4 @@
-"""Mod Tester: try out Sims 4 mods on their own, find a broken mod, then put your own mods back."""
+"""Sims 4 Mod Test: try out Sims 4 mods on their own, find a broken mod, then put your own mods back."""
 from __future__ import annotations
 
 import os
@@ -8,18 +8,22 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QProcess, QSettings, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QByteArray, QLockFile, QSettings, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QFileDialog, QFrame, QHBoxLayout,
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QMessageBox,
                                QLabel, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStackedLayout,
                                QStackedWidget, QVBoxLayout, QWidget)
 
-import core
-import risks
+import psutil
 
-APP_NAME = "Mod Tester"
-VERSION = "1.0.0"
+import core
+import platforms
+import risks
+import updates
+from version import __version__
+
+APP_NAME = "Sims 4 Mod Test"
 SUPPORT_URL = "https://buymeacoffee.com/stixe"
 
 # ---------------------------------------------------------------- theme
@@ -56,7 +60,7 @@ ICON_APP = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
             '<rect x="15" y="15" width="22" height="22" rx="5" fill="none" stroke="#FFFFFF" stroke-width="4"/>'
             '<rect x="27" y="27" width="22" height="22" rx="5" fill="#FFFFFF"/></svg>')
 
-_icon_dir = Path(tempfile.mkdtemp(prefix="modtester-"))
+_icon_dir = Path(tempfile.mkdtemp(prefix="s4modtest-"))
 
 
 def svg_pixmap(svg: str, size: int, ratio: float = 2.0) -> QPixmap:
@@ -223,7 +227,7 @@ def _tray_phrase(names: list[str], kinds: list[str]) -> str:
 
 
 SAVE_WARNING = ("Don’t save your usual households during the test. Without your own CC they lose hair, "
-                "clothes and furniture. Mod Tester keeps a copy of your saves from before the test, "
+                "clothes and furniture. Sims 4 Mod Test keeps a copy of your saves from before the test, "
                 "so you can put them back afterwards.")
 
 
@@ -422,8 +426,8 @@ class Worker(QThread):
         except core.TesterError as e:
             self.failed.emit(str(e))
         except Exception as e:  # unexpected: still say what happened and what to check
-            self.failed.emit(f"Mod Tester stopped because of an unexpected problem ({type(e).__name__}: {e}). "
-                             "Open Mod Tester again; it checks your folders when it starts.")
+            self.failed.emit(f"Sims 4 Mod Test stopped because of an unexpected problem ({type(e).__name__}: {e}). "
+                             "Open Sims 4 Mod Test again; it checks your folders when it starts.")
 
 
 class GameWatcher(QThread):
@@ -522,7 +526,7 @@ class SearchSetupPage(QWidget):
         lay.setSpacing(12)
         lay.addWidget(label("Find a broken mod", "section"))
         lay.addWidget(label(
-            "Something wrong in your game, like errors, odd heads or a missing menu? Mod Tester switches "
+            "Something wrong in your game, like errors, odd heads or a missing menu? Sims 4 Mod Test switches "
             "half of your mods off. You play, close the game and say whether the problem is still there. "
             "Then it halves again, until one mod is left.", "muted", wrap=True))
         self.count = label("", wrap=True)
@@ -663,7 +667,8 @@ class MainWindow(QWidget):
         self.setFocusPolicy(Qt.ClickFocus)
         self.resize(640, 720)
         self.setMinimumSize(500, 580)
-        self.settings = QSettings("Mod Tester", "Mod Tester")
+        self.settings = QSettings("Sims 4 Mod Test", "Sims 4 Mod Test")
+        self.migrate_old_settings()
         self.sims_dir: Path | None = None
         self.worker: Worker | None = None
         self.side_jobs: list[Worker] = []
@@ -683,7 +688,7 @@ class MainWindow(QWidget):
         title_row.addStretch(1)
         coffee = button("Buy me a coffee", "coffee")
         coffee.setIcon(QIcon(svg_pixmap(ICON_CUP, 16)))
-        coffee.setToolTip(f"Mod Tester is free. If it helps you, you can support it: {SUPPORT_URL}")
+        coffee.setToolTip(f"Sims 4 Mod Test is free. If it helps you, you can support it: {SUPPORT_URL}")
         coffee.setAccessibleName("Buy me a coffee (opens buymeacoffee.com)")
         coffee.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(SUPPORT_URL)))
         title_row.addWidget(coffee, 0, Qt.AlignVCenter)
@@ -693,9 +698,19 @@ class MainWindow(QWidget):
         self.folder_label = ElidedLabel("", "muted")
         folder_row.addWidget(self.folder_label, 1)
         self.change_btn = button("Change", "link")
+        self.change_btn.setAccessibleName("Choose the Sims 4 folder")
         self.change_btn.clicked.connect(self.choose_sims_dir)
         folder_row.addWidget(self.change_btn)
         lay.addLayout(folder_row)
+        game_row = QHBoxLayout()
+        game_row.setSpacing(8)
+        self.game_label = ElidedLabel("", "muted")
+        game_row.addWidget(self.game_label, 1)
+        self.change_game_btn = button("Change", "link")
+        self.change_game_btn.setAccessibleName("Choose the game folder")
+        self.change_game_btn.clicked.connect(self.choose_game_dir)
+        game_row.addWidget(self.change_game_btn)
+        lay.addLayout(game_row)
         lay.addSpacing(14)
 
         self.segments = QFrame()
@@ -717,6 +732,8 @@ class MainWindow(QWidget):
         lay.addLayout(seg_row)
         lay.addSpacing(10)
 
+        self.update_notice = Notice("ok")
+        lay.addWidget(self.update_notice)
         self.after = Notice("ok")  # results of a restore; stays until the next action
         lay.addWidget(self.after)
         self.saves_notice = Notice("warn")
@@ -760,7 +777,9 @@ class MainWindow(QWidget):
         self.timer.start()
 
         self.set_sims_dir(self.initial_sims_dir())
+        self.show_game_dir()
         self.load_game_index()
+        QTimer.singleShot(3000, self.check_for_update)
 
     # -- theme
 
@@ -779,7 +798,7 @@ class MainWindow(QWidget):
         if saved and core.looks_like_sims_dir(Path(saved)):
             return Path(saved)
         docs = Path(QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation))
-        found = core.find_sims_dirs(docs)
+        found = core.find_sims_dirs(platforms.documents_folders(docs))
         return found[0] if found else None
 
     def set_sims_dir(self, path: Path | None) -> None:
@@ -788,8 +807,8 @@ class MainWindow(QWidget):
             self.folder_label.set_full_text("Sims 4 folder not found")
             self.show_current_page()
             self.setup.notice.show_message(
-                "Mod Tester could not find your Sims 4 folder. Use Change to pick the folder "
-                "that holds Mods and Tray, usually Documents\\Electronic Arts\\The Sims 4.", "warn")
+                "Sims 4 Mod Test could not find your Sims 4 folder. Use Change to pick the folder "
+                "that holds Mods and Tray. It is usually Electronic Arts, The Sims 4 in your Documents.", "warn")
             return
         self.settings.setValue("sims_dir", str(path))
         self.folder_label.set_full_text(f"Sims 4 folder: {path}")
@@ -798,8 +817,8 @@ class MainWindow(QWidget):
             core.recover(path)
         except (OSError, core.TesterError) as e:
             self.after.show_message(
-                f"Mod Tester found an unfinished swap and could not tidy it up: {e} "
-                "Close other programs and open Mod Tester again.", "error")
+                f"Sims 4 Mod Test found an unfinished swap and could not tidy it up: {e} "
+                "Close other programs and open Sims 4 Mod Test again.", "error")
         self.show_current_page()
         self.count_mods()
         if not core.in_test(path):
@@ -820,45 +839,97 @@ class MainWindow(QWidget):
             return
         self.set_sims_dir(path)
 
+    def migrate_old_settings(self) -> None:
+        """Bring over what the app remembered under its old name (Mod Tester): the chosen Sims 4
+        folder above all, since a test may be running there."""
+        if self.settings.value("migrated", False, type=bool):
+            return
+        old = QSettings("Mod Tester", "Mod Tester")
+        for key in ("sims_dir", "last_pick"):
+            if old.value(key) and not self.settings.value(key):
+                self.settings.setValue(key, old.value(key))
+        exe = old.value("game_exe", "", type=str)
+        learned = platforms.game_dir_from_process(exe) if exe else None
+        if learned and not self.settings.value("game_dir"):
+            self.settings.setValue("game_dir", str(learned))
+        self.settings.setValue("migrated", True)
+
     def game_dir(self) -> Path | None:
-        saved = self.settings.value("game_exe", "", type=str)
-        if saved and Path(saved).is_file():
-            return risks.game_dir_of(Path(saved))
-        found = risks.find_game_dir()
-        if found:
-            self.settings.setValue("game_exe", str(risks.game_exe(found)))
-        return found
+        """The game folder the user picked, else one found in the usual places."""
+        saved = self.settings.value("game_dir", "", type=str)
+        if saved and platforms.game_content_root(Path(saved)):
+            return Path(saved)
+        return platforms.find_game_dir()
+
+    def set_game_dir(self, path: Path) -> None:
+        self.settings.setValue("game_dir", str(path))
+        self.show_game_dir()
+        self.load_game_index()
+
+    def show_game_dir(self) -> None:
+        gd = self.game_dir()
+        self.game_label.set_full_text(f"Game folder: {gd}" if gd else
+                                      "Game folder not found. Pick it to check mods against the game’s own files.")
+
+    def choose_game_dir(self) -> None:
+        start = str(self.game_dir() or Path.home())
+        # The Mac's own dialog won't pick "The Sims 4.app" as a folder (it's an app bundle); Qt's will.
+        options = QFileDialog.Option.DontUseNativeDialog if platforms.MACOS else QFileDialog.Option(0)
+        picked = QFileDialog.getExistingDirectory(self, "Choose where The Sims 4 is installed", start, options)
+        if not picked:
+            return
+        path = Path(picked)
+        for candidate in (path, *path.parents[:3]):  # also accept Game\Bin or Data picked by mistake
+            if platforms.game_content_root(candidate):
+                self.set_game_dir(candidate)
+                return
+        self.pages.currentWidget().notice.show_message(
+            f"“{path.name}” doesn’t look like the game’s folder. Pick the folder (or on a Mac, "
+            "the app) The Sims 4 is installed in. It holds Data and Game.", "warn")
 
     def game_changed(self, running: bool, exe: str) -> None:
-        if exe and exe.lower().endswith("ts4_x64.exe") and exe != self.settings.value("game_exe", "", type=str):
-            self.settings.setValue("game_exe", exe)  # learned from the running game
-            self.load_game_index()
+        learned = platforms.game_dir_from_process(exe) if exe else None
+        if learned and platforms.game_content_root(learned) and learned != self.game_dir():
+            self.set_game_dir(learned)  # learned from the running game
         if running != self.game_on:
             self.game_on = running
             self.refresh()
 
     def play(self) -> None:
-        exe = self.settings.value("game_exe", "", type=str)
-        if not exe or not Path(exe).is_file():
+        gd = self.game_dir()
+        if gd is None and (platforms.WINDOWS or platforms.MACOS):
+            self.choose_game_dir()
             gd = self.game_dir()
-            exe = str(risks.game_exe(gd)) if gd else ""
-        if not exe:
-            picked, _ = QFileDialog.getOpenFileName(
-                self, "Find The Sims 4 (Game\\Bin\\TS4_x64.exe)", str(Path.home()), "The Sims 4 (TS4_x64.exe)")
-            if not picked:
+            if gd is None:
                 return
-            exe = picked
-            self.settings.setValue("game_exe", exe)
-            self.load_game_index()
-        started = QProcess.startDetached(exe, [], str(Path(exe).parent))
-        if not (started[0] if isinstance(started, tuple) else started):
-            page = self.pages.currentWidget()
-            page.notice.show_message(f"The Sims 4 did not start from “{exe}”. "
-                                     "Start it the usual way.", "error")
-            self.settings.remove("game_exe")
-            return
         page = self.pages.currentWidget()
+        if not platforms.launch_game(gd):
+            page.notice.show_message("The Sims 4 did not start. Start it the usual way, or use Change next "
+                                     "to the game folder to pick it.", "error")
+            return
         page.status.setText("Starting The Sims 4")
+
+    def check_for_update(self) -> None:
+        """Once a day: is there a newer version on GitHub? Offered calmly; nothing is installed."""
+        today = time.strftime("%Y-%m-%d")
+        if self.settings.value("update_checked", "", type=str) == today:
+            return
+        self.settings.setValue("update_checked", today)
+        skipped = self.settings.value("update_skipped", "", type=str)
+
+        def done(release):
+            if release is None:
+                return
+
+            def not_now():
+                self.settings.setValue("update_skipped", release.version)
+                self.update_notice.hide()
+
+            self.update_notice.show_message(
+                f"Sims 4 Mod Test {release.version} is out. You have {__version__}.", "ok",
+                "Download", lambda: QDesktopServices.openUrl(QUrl(release.download)), "Not now", not_now)
+
+        self.run_side(Worker(updates.available_update, skipped), done)
 
     def load_game_index(self) -> None:
         """Read the game's own CAS parts and sliders in the background, for the override check."""
@@ -866,9 +937,12 @@ class MainWindow(QWidget):
         if gd is None or getattr(self, "_index_for", None) == gd:
             return
         self._index_for = gd
+        self.game_keys = None  # until this game's keys are read, nothing is checked against the old ones
 
         def done(keys):
-            self.game_keys = keys
+            if gd != self._index_for:
+                return  # another game folder was picked meanwhile
+            self.game_keys, self._keys_for = keys, gd
             self.check_items()
 
         self.run_side(Worker(risks.game_index, gd), done)
@@ -885,6 +959,7 @@ class MainWindow(QWidget):
         self.state = core.load_state(sims) if running else None
         self.segments.setVisible(not running)
         self.change_btn.setVisible(not running)
+        self.change_game_btn.setVisible(not running)
         if running and self.state and self.state.get("mode") == "search":
             self.show_search_round()
             self.pages.setCurrentWidget(self.search)
@@ -984,10 +1059,18 @@ class MainWindow(QWidget):
         names = [i.name for i in (self.state or {}).get("items", [])]
         key = (str(self.reports[0]), core.mtime(self.reports[0]))
         if key not in self.suspect_cache:
-            self.suspect_cache[key] = risks.report_suspects(self.reports[0], names)
-        suspects = self.suspect_cache[key]
+            suspects = risks.report_suspects(self.reports[0], names)
+            note = ""
+            if suspects and suspects[0].lower().endswith(".ts4script"):
+                # the game only loads scripts from Mods or one folder below it, so that's all to look at
+                mods, name = self.sims_dir / "Mods", core.glob_escape(suspects[0])
+                found = next(iter([*mods.glob(name), *mods.glob(f"*/{name}")]), None)
+                if found:
+                    note = risks.outdated_note(found, risks.last_update(self.game_dir(), self.sims_dir))
+            self.suspect_cache[key] = (suspects, note)
+        suspects, note = self.suspect_cache[key]
         if suspects:
-            text += " It mentions " + " and ".join(f"“{s}”" for s in suspects[:2]) + "."
+            text += " It mentions " + " and ".join(f"“{s}”" for s in suspects[:2]) + "." + note
         elif page is self.testing:
             text += " One of the test mods may be broken or outdated."
         page.errors.show_message(text, action="Open report", handler=lambda: self.open_path(self.reports[0]))
@@ -997,7 +1080,7 @@ class MainWindow(QWidget):
         game = self.game_on
         s = self.setup
         has_dir = self.sims_dir is not None
-        for w in (s.add_files_btn, s.add_folder_btn, s.clear_btn, self.change_btn):
+        for w in (s.add_files_btn, s.add_folder_btn, s.clear_btn, self.change_btn, self.change_game_btn):
             w.setEnabled(not busy)
         for b in self.mode_group.buttons():
             b.setEnabled(not busy)
@@ -1081,11 +1164,13 @@ class MainWindow(QWidget):
         self.run_job(Worker(core.inspect_paths, paths, self.sims_dir), ok, fail)
 
     def check_items(self) -> None:
-        """Look for risky files among the test items, in the background."""
-        full = self.game_keys is not None
+        """Look for files that replace the game's own sliders or CAS items, in the background.
+        Needs the game's own keys; until they're read there's nothing to compare with."""
+        if self.game_keys is None:
+            return
 
         def key(i: core.ModItem) -> tuple:
-            return (os.path.normcase(i.path), i.size, core.mtime(Path(i.path)), full)
+            return (os.path.normcase(i.path), i.size, core.mtime(Path(i.path)), str(self._keys_for))
 
         todo = []
         for i in self.setup.items:
@@ -1096,14 +1181,14 @@ class MainWindow(QWidget):
         self.setup.set_items(self.setup.items)
         if not todo:
             return
-        keys, updated = self.game_keys, risks.last_update(self.game_dir(), self.sims_dir)
+        keys = self.game_keys
 
         def run():
             results = []
             for i in todo:
                 if QThread.currentThread().isInterruptionRequested():
                     break  # a test is about to start; unchecked items are checked next time
-                results.append((i, key(i), risks.check(i, keys, updated)))
+                results.append((i, key(i), risks.check(i, keys)))
             return results
 
         def done(results):
@@ -1240,10 +1325,10 @@ class MainWindow(QWidget):
             elif result.removed:
                 text += f" The broken mod is in \u201c{result.removed.name}\u201d next to Mods."
             elif page is self.testing:
-                text += " The test copies went to the Recycle Bin."
+                text += f" The test copies went to the {platforms.trash_name()}."
             if result.leftovers:
-                text += (" Some test files could not go to the Recycle Bin. You can delete the folders named "
-                         "“finished Mod Tester test” next to Mods.")
+                text += (f" Some test files could not go to the {platforms.trash_name()}. You can delete the folders named "
+                         "“test copies” next to Mods.")
             self.after.show_message(text, "ok")
             self.offer_saves(result.changed_saves)
             self.count_mods()
@@ -1280,7 +1365,7 @@ class MainWindow(QWidget):
 
         def ok(_):
             self.saves_notice.show_message(
-                "Your saves from before the test are back. The newer versions went to the Recycle Bin.", "ok")
+                f"Your saves from before the test are back. The newer versions went to the {platforms.trash_name()}.", "ok")
 
         def fail(msg: str):
             self.saves_notice.show_message(msg, "error", "Try again", self.restore_saves)
@@ -1310,32 +1395,34 @@ def _ctime(path: Path) -> float:
         return time.time()
 
 
-def _first_instance():
-    """A named mutex: two windows swapping the same folders at once would trip over each other."""
-    import ctypes
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateMutexW.restype = ctypes.c_void_p
-    handle = kernel32.CreateMutexW(None, False, "Local\\ModTester-single-instance")
-    ERROR_ALREADY_EXISTS = 183
-    return handle if handle and ctypes.get_last_error() != ERROR_ALREADY_EXISTS else None
-
-
 def main() -> int:
-    mutex = _first_instance()
-    if mutex is None:
-        import ctypes
-        MB_ICONINFORMATION, MB_SETFOREGROUND = 0x40, 0x10000
-        ctypes.windll.user32.MessageBoxW(None, "Mod Tester is already open. Look for it in the taskbar.",
-                                         APP_NAME, MB_ICONINFORMATION | MB_SETFOREGROUND)
-        return 0
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
-    app.setFont(QFont("Segoe UI", 10))
+    if platforms.WINDOWS:
+        app.setFont(QFont("Segoe UI", 10))  # elsewhere the system font is the right one
     app.setWindowIcon(QIcon(svg_pixmap(ICON_APP, 64)))
+
+    # One window at a time: two windows swapping the same folders would trip over each other.
+    # That includes the app under its old name, which used a different lock.
+    if any((p.info.get("name") or "").lower() == "mod tester.exe" for p in psutil.process_iter(["name"])):
+        QMessageBox.information(None, APP_NAME, "The older Mod Tester is still open. Close it first, "
+                                "then open Sims 4 Mod Test again.")
+        return 0
+    core.migrate_data_dir()  # before the lock below creates the new data folder
+    core.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    lock = QLockFile(str(core.DATA_DIR / "app.lock"))
+    lock.setStaleLockTime(0)  # a crashed app's lock is noticed by its dead process, not by age
+    if not lock.tryLock(200):
+        QMessageBox.information(None, APP_NAME, "Sims 4 Mod Test is already open. Look for it in the taskbar.")
+        return 0
+
     win = MainWindow()
     win.show()
+    if os.environ.get("SIMS4MODTEST_SMOKE_TEST"):  # CI: the built app starts, shows its window, quits
+        QTimer.singleShot(3000, win.close)
     return app.exec()
 
 

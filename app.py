@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +26,9 @@ import updates
 from version import __version__
 
 APP_NAME = "Sims 4 Mod Test"
+REPORT_CHECK_MS = 3000      # how often a running test looks for new error reports
+UPDATE_CHECK_DELAY_MS = 3000  # the update check waits until the window is up
+SMOKE_TEST_CLOSE_MS = 3000  # CI: how long the built app stays open before closing itself
 SUPPORT_URL = "https://buymeacoffee.com/stixe"
 
 # ---------------------------------------------------------------- theme
@@ -233,7 +237,14 @@ def _tray_phrase(names: list[str], kinds: list[str]) -> str:
     return " and ".join(f"the {k} “{n}”" if k else f"“{n}”" for n, k in zip(names, kinds))
 
 
-def save_warning(backed_up: bool) -> str:
+def where_sims_folder_is() -> str:
+    if platforms.WINDOWS or platforms.MACOS:
+        return "It is usually Electronic Arts, The Sims 4 in your Documents."
+    return ("With Steam and Proton it is inside your Steam library: steamapps/compatdata/1222670/pfx/drive_c/"
+            "users/steamuser/Documents/Electronic Arts/The Sims 4.")
+
+
+def save_warning_text(backed_up: bool) -> str:
     text = ("Don\u2019t save your usual households during the test. Without your own CC they lose hair, "
             "clothes and furniture.")
     if backed_up:
@@ -342,6 +353,12 @@ class Notice(QFrame):
         self.show()
 
 
+def save_warning_notice() -> "Notice":
+    notice = Notice("warn")
+    notice.show_message(save_warning_text(True))
+    return notice
+
+
 class ItemRow(QFrame):
     removed = Signal(object)
 
@@ -448,9 +465,10 @@ class Worker(QThread):
             else:
                 result = self.fn(*self.args)
             self.succeeded.emit(result)
-        except core.TesterError as e:
+        except (core.TesterError, updates.CheckFailed) as e:  # expected: said to the user, not logged
             self.failed.emit(str(e))
-        except Exception as e:  # unexpected: still say what happened and what to check
+        except Exception as e:  # unexpected: log it for a bug report, and still say what happened
+            core.log_error(traceback.format_exc())
             self.failed.emit(f"Sims 4 Mod Test stopped because of an unexpected problem ({type(e).__name__}: {e}). "
                              "Open Sims 4 Mod Test again; it checks your folders when it starts.")
 
@@ -460,6 +478,7 @@ class GameWatcher(QThread):
     changed = Signal(bool, str)  # running, path of the game's exe ("" if unknown)
 
     def run(self) -> None:
+        last_error = ""
         while not self.isInterruptionRequested():
             exe = ""
             try:
@@ -468,11 +487,13 @@ class GameWatcher(QThread):
                     try:
                         exe = proc.exe() or ""
                         break
-                    except Exception:
-                        continue
+                    except (psutil.Error, OSError):
+                        continue  # no permission to see the path: still counts as running
                 self.changed.emit(bool(procs), exe)
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001 - the watcher must keep running, or buttons stay disabled
+                if repr(e) != last_error:
+                    last_error = repr(e)
+                    core.log_error(f"checking whether the game runs: {e!r}")
             for _ in range(20):
                 if self.isInterruptionRequested():
                     return
@@ -556,8 +577,7 @@ class SearchSetupPage(QWidget):
             "Then it halves again, until one mod is left.", "muted", wrap=True))
         self.count = label("", wrap=True)
         lay.addWidget(self.count)
-        self.save_warning = Notice("warn")
-        self.save_warning.show_message(save_warning(True))
+        self.save_warning = save_warning_notice()
         lay.addWidget(self.save_warning)
         self.notice = Notice("error")
         lay.addWidget(self.notice)
@@ -581,8 +601,7 @@ class TestingPage(QWidget):
         lay.addWidget(self.heading)
         self.body = label("", "muted", wrap=True)
         lay.addWidget(self.body)
-        self.save_warning = Notice("warn")
-        self.save_warning.show_message(save_warning(True))
+        self.save_warning = save_warning_notice()
         lay.addWidget(self.save_warning)
         self.errors = Notice("warn")
         lay.addWidget(self.errors)
@@ -637,8 +656,7 @@ class SearchPage(QWidget):
         fl.addWidget(self.found_where)
         lay.addWidget(self.found)
 
-        self.save_warning = Notice("warn")
-        self.save_warning.show_message(save_warning(True))
+        self.save_warning = save_warning_notice()
         lay.addWidget(self.save_warning)
         self.errors = Notice("warn")
         lay.addWidget(self.errors)
@@ -673,7 +691,7 @@ class SearchPage(QWidget):
         self.status = label("", "muted", wrap=True)
         bottom.addWidget(self.status, 1)
         self.stop_btn = button("Stop and restore my mods", "link")
-        self.keep_btn = button("Restore everything")
+        self.keep_btn = button("Restore and keep it")
         self.remove_btn = button("Restore without it", "primary")
         bottom.addWidget(self.stop_btn, 0, Qt.AlignVCenter)
         bottom.addWidget(self.keep_btn)
@@ -704,8 +722,10 @@ class SettingsPage(QWidget):
 
         lay.addWidget(label("Folders", "section"))
         folders = self._card(lay)
-        self.sims_path, self.change_sims_btn = self._folder_row(folders, "Sims 4 folder", "Change the Sims 4 folder")
-        self.game_path, self.change_game_btn = self._folder_row(folders, "Game folder", "Change the game folder")
+        self.sims_path, self.change_sims_btn = self._folder_row(
+            folders, "Sims 4 folder, where your Mods, Tray and saves are", "Change the Sims 4 folder")
+        self.game_path, self.change_game_btn = self._folder_row(
+            folders, "Game folder, where The Sims 4 is installed", "Change the game folder")
         lay.addSpacing(10)
 
         lay.addWidget(label("Appearance", "section"))
@@ -733,8 +753,9 @@ class SettingsPage(QWidget):
             "If the game saves over one of your saves during a test, you can put the old one back. "
             "Turn this off if your saves are very large.")
         self.clear_cache = self._toggle(
-            test_card, "Clear the game’s thumbnail cache",
-            "Before and after each test, so new CC shows the right pictures. The game rebuilds it.")
+            test_card, "Clear the game’s cache files",
+            "Before and after each test, so new CC shows the right pictures and script mods start fresh. "
+            "The game rebuilds them.")
         self.auto_start = self._toggle(
             test_card, "Start The Sims 4 when a test is ready", "Also for each round of a broken-mod search.")
         lay.addSpacing(10)
@@ -838,6 +859,7 @@ class MainWindow(QWidget):
         self.reports: list[Path] = []
         self.game_keys: frozenset[int] | None = None
         self.closing = False  # set when the window closes: no new background work after that
+        self.deferred: list[tuple] = []  # readers waiting for a folder move to finish
         self.mod_count: int | None = None  # mods in the Mods folder (for the search), None while unknown
         self.risk_cache: dict[tuple, list[str]] = {}     # (path, size, mtime, with game index) -> warnings
         self.suspect_cache: dict[tuple, list[str]] = {}  # (report, mtime) -> mods it mentions
@@ -896,6 +918,8 @@ class MainWindow(QWidget):
         lay.addWidget(self.after)
         self.saves_notice = Notice("warn")
         lay.addWidget(self.saves_notice)
+        self.game_settings_notice = Notice("warn")
+        lay.addWidget(self.game_settings_notice)
         lay.addSpacing(4)
 
         self.setup = TestSetupPage()
@@ -930,14 +954,14 @@ class MainWindow(QWidget):
         self.watcher.changed.connect(self.game_changed)
         self.watcher.start()
         self.timer = QTimer(self)
-        self.timer.setInterval(3000)
+        self.timer.setInterval(REPORT_CHECK_MS)
         self.timer.timeout.connect(self.check_reports)
         self.timer.start()
 
         self.set_sims_dir(self.initial_sims_dir())
         self.show_game_dir()
         self.load_game_index()
-        QTimer.singleShot(3000, self.check_for_update)
+        QTimer.singleShot(UPDATE_CHECK_DELAY_MS, self.check_for_update)
 
     # -- theme
 
@@ -965,8 +989,9 @@ class MainWindow(QWidget):
             self.folder_label.set_full_text("Not found. Pick the folder that holds Mods and Tray.")
             self.show_current_page()
             self.setup.notice.show_message(
-                "Sims 4 Mod Test could not find your Sims 4 folder. Pick the folder that holds Mods and Tray in "
-                "Settings. It is usually Electronic Arts, The Sims 4 in your Documents.", "warn",
+                "Sims 4 Mod Test could not find your Sims 4 folder. If you have never started The Sims 4 on this "
+                "computer, start it once and open Sims 4 Mod Test again. Otherwise pick the folder that holds "
+                "Mods and Tray in Settings. " + where_sims_folder_is(), "warn",
                 "Open Settings", lambda: self.open_tab(2))
             return
         self.prefs.notice.hide()
@@ -1054,6 +1079,8 @@ class MainWindow(QWidget):
         if running != self.game_on:
             self.game_on = running
             self.refresh()
+            if not running:
+                self.check_game_settings()  # the game writes its options when it closes
 
     def play(self, interactive: bool = True) -> None:
         gd = self.game_dir()
@@ -1118,13 +1145,13 @@ class MainWindow(QWidget):
         if not manual:
             if not self.opt("check_updates") or self.settings.value("update_checked", "", type=str) == today:
                 return
-            self.settings.setValue("update_checked", today)
         skipped = "" if manual else self.settings.value("update_skipped", "", type=str)
         if manual:
             self.prefs.version_label.setText("Looking for a new version")
             self.prefs.check_now_btn.setEnabled(False)
 
         def done(release):
+            self.settings.setValue("update_checked", today)  # only once GitHub answered
             if manual:
                 self.prefs.check_now_btn.setEnabled(True)
                 self.prefs.version_label.setText(
@@ -1149,10 +1176,7 @@ class MainWindow(QWidget):
                 f"Sims 4 Mod Test {release.version} is out. You have {__version__}.", "ok",
                 "Download", lambda: QDesktopServices.openUrl(QUrl(release.download)), "Not now", not_now)
 
-        if manual:
-            self.run_side(Worker(updates.find_update, skipped), done, on_fail=failed)
-        else:
-            self.run_side(Worker(updates.available_update, skipped), done)
+        self.run_side(Worker(updates.find_update, skipped), done, on_fail=failed)
 
     def load_game_index(self) -> None:
         """Read the game's own CAS parts and sliders in the background, for the override check."""
@@ -1171,7 +1195,10 @@ class MainWindow(QWidget):
         def build():
             return risks.game_index(gd, stop=QThread.currentThread().isInterruptionRequested)
 
-        self.run_side(Worker(build), done)
+        def failed(msg: str):
+            core.log_error(f"reading the game's own files in {gd}: {msg}")
+
+        self.run_side(Worker(build), done, on_fail=failed)
 
     # -- pages
 
@@ -1210,11 +1237,12 @@ class MainWindow(QWidget):
             self.pages.setCurrentWidget(self.prefs)
         else:
             self.pages.setCurrentWidget(self.setup)
-        self.search_setup.save_warning.text.setText(save_warning(self.opt("backup_saves")))
+        self.search_setup.save_warning.text.setText(save_warning_text(self.opt("backup_saves")))
         backed_up = bool(self.state and self.state.get("saves"))  # what this test really did
         for page in (self.testing, self.search):
-            page.save_warning.text.setText(save_warning(backed_up))
+            page.save_warning.text.setText(save_warning_text(backed_up))
         self.setFocus()  # don't leave keyboard focus on a button that was just rebuilt or hidden
+        self.check_game_settings()
         self.check_reports()
         self.refresh()
 
@@ -1231,12 +1259,14 @@ class MainWindow(QWidget):
         s.stop_btn.setVisible(not done)
         s.play_btn.setVisible(not done)
         s.keep_btn.setVisible(done)
-        s.keep_btn.setText("Restore my mods" if not_mods else "Restore everything")
+        s.keep_btn.setText("Restore my mods" if not_mods else "Restore and keep it")
         s.remove_btn.setVisible(found is not None)
         if not_mods:
             s.heading.setText("It isn\u2019t a mod")
             s.body.setText("The problem is there even with all of your mods switched off, so no mod causes it. "
-                           "Restore your mods, then try Repair for The Sims 4 in the EA app.")
+                           "It can come from a household or lot in your Tray, or from the game itself. Restore "
+                           "your mods, then repair the game: in the EA app choose Repair for The Sims 4; on "
+                           "Steam use Properties, Installed Files, Verify integrity.")
             return
         if found is not None:
             title, where = core.unit_label(units[found])
@@ -1249,15 +1279,16 @@ class MainWindow(QWidget):
             return
         if st["round"] == 0:
             s.heading.setText("First, a round with all mods off")
-            s.body.setText("All of your mods are switched off. Start the game and check whether the problem is "
-                           "still there. If it is gone, a mod causes it and the search goes on.")
+            s.body.setText("All of your mods are switched off. Start the game and do exactly what caused the "
+                           "problem. If it is gone, a mod causes it and the search goes on.")
             return
         total = st["round"] + core.rounds_left(len(candidates)) - 1
         s.heading.setText(f"Round {st['round']} of about {total}")
         on = sum(len(units[i]) for i in st["testing"])
         s.body.setText(f"{on:,} of your mod files are switched on, the rest are off. "
                        f"{plural(len(candidates), 'mod')} could still be the broken one. Start the game and "
-                       "check whether the problem is still there.")
+                       "do exactly what caused the problem. If it doesn\u2019t show up right away, play a "
+                       "little longer before you answer: one wrong answer sends the search the wrong way.")
 
     def count_mods(self) -> None:
         sims = self.sims_dir
@@ -1267,6 +1298,8 @@ class MainWindow(QWidget):
             return
 
         def done(units):
+            if sims != self.sims_dir:
+                return  # the user picked another folder meanwhile
             n = len(units)
             self.mod_count = n
             self.refresh()
@@ -1279,6 +1312,21 @@ class MainWindow(QWidget):
 
     def busy(self) -> bool:
         return self.worker is not None
+
+    def check_game_settings(self) -> None:
+        """Game updates switch off custom content and script mods; a test with them off shows nothing."""
+        mods_on, scripts_on = core.game_mod_settings(self.sims_dir) if self.sims_dir else (None, None)
+        where = "in the game, under Game Options, Other"
+        if mods_on is False:
+            self.game_settings_notice.show_message(
+                f"Custom content is switched off in the game, so no mods will load. Turn on \u201cEnable Custom "
+                f"Content and Mods\u201d {where}, then restart the game.")
+        elif scripts_on is False:
+            self.game_settings_notice.show_message(
+                f"Script mods are switched off in the game. Turn on \u201cScript Mods Allowed\u201d {where}, "
+                "then restart the game.")
+        else:
+            self.game_settings_notice.hide()
 
     def check_reports(self) -> None:
         page = self.pages.currentWidget()
@@ -1305,7 +1353,9 @@ class MainWindow(QWidget):
             self.suspect_cache[key] = (suspects, note)
         suspects, note = self.suspect_cache[key]
         if suspects:
-            text += " It mentions " + " and ".join(f"“{s}”" for s in suspects[:2]) + "." + note
+            text += " It mentions " + " and ".join(f"\u201c{s}\u201d" for s in suspects[:2]) + "." + note
+            if page is self.testing:
+                text += " Restore your mods, then remove or update that mod before you test again."
         elif page is self.testing:
             text += " One of the test mods may be broken or outdated."
         page.errors.show_message(text, action="Open report", handler=lambda: self.open_path(self.reports[0]))
@@ -1370,6 +1420,8 @@ class MainWindow(QWidget):
             self.add_paths([Path(folder)])
 
     def add_paths(self, paths: list[Path]) -> None:
+        if self.busy():
+            return
         s = self.setup
         s.notice.hide()
         self.after.hide()
@@ -1399,7 +1451,8 @@ class MainWindow(QWidget):
             s.progress.hide()
             s.notice.show_message(msg, "error")
 
-        self.run_job(Worker(core.inspect_paths, paths, self.sims_dir), ok, fail)
+        reader = risks.package_keys if self.game_keys is not None else None  # else checked later, interruptibly
+        self.run_job(Worker(core.inspect_paths, paths, self.sims_dir, reader), ok, fail)
 
     def check_items(self) -> None:
         """Look for files that replace the game's own sliders or CAS items, in the background.
@@ -1407,8 +1460,10 @@ class MainWindow(QWidget):
         if self.game_keys is None:
             return
 
+        keys_for = self._keys_for  # the game these keys belong to, fixed for this run
+
         def key(i: core.ModItem) -> tuple:
-            return (os.path.normcase(i.path), i.size, core.mtime(Path(i.path)), str(self._keys_for))
+            return (os.path.normcase(i.path), i.size, core.mtime(Path(i.path)), str(keys_for))
 
         todo = []
         for i in self.setup.items:
@@ -1430,9 +1485,13 @@ class MainWindow(QWidget):
             return results
 
         def done(results):
+            if keys_for != self._keys_for:
+                return  # another game folder was picked meanwhile; its own check follows
+            current = {id(i) for i in self.setup.items}
             for item, k, warnings in results:
-                item.warnings = warnings
                 self.risk_cache[k] = warnings
+                if id(item) in current:
+                    item.warnings = warnings
             self.setup.set_items(self.setup.items)
 
         self.run_side(Worker(run), done, touches_sims=True)
@@ -1481,12 +1540,18 @@ class MainWindow(QWidget):
         self.worker.deleteLater()
         self.worker = None
         self.refresh()
+        waiting, self.deferred = self.deferred, []
+        for worker, on_ok, on_fail in waiting:
+            self.run_side(worker, on_ok, touches_sims=True, on_fail=on_fail)
 
     def run_side(self, worker: Worker, on_ok, touches_sims: bool = False, on_fail=None) -> None:
         """A read-only job (counting, checking); its errors are not worth interrupting for,
         unless the caller asks to hear about them."""
         if self.closing:
             return  # e.g. the update check's timer firing while the window closes
+        if touches_sims and self.busy():
+            self.deferred.append((worker, on_ok, on_fail))  # its open files could block the move
+            return
         worker.touches_sims = touches_sims
         self.side_jobs.append(worker)
         worker.succeeded.connect(on_ok)
@@ -1501,10 +1566,11 @@ class MainWindow(QWidget):
         worker.start()
 
     def start_test(self) -> None:
+        if self.busy():
+            return
         s = self.setup
         s.notice.hide()
         self.after.hide()
-        self.saves_notice.hide()
         s.status.setText("Backing up your saves and copying the test mods" if self.opt("backup_saves")
                          else "Copying the test mods")
         s.progress.setRange(0, 100)
@@ -1524,28 +1590,34 @@ class MainWindow(QWidget):
 
         def ok(_):
             s.progress.hide()
+            self.saves_notice.hide()
             self.show_current_page()
             self.auto_start_game()
 
         def fail(msg: str):
             s.progress.hide()
             s.notice.show_message(msg, "error")
+            self.offer_saves(core.pending_saves(self.sims_dir))  # the choice it may be waiting for
             self.show_current_page()
 
         self.run_job(worker, ok, fail)
 
     def start_search(self) -> None:
+        if self.busy():
+            return
         ss = self.search_setup
         ss.notice.hide()
         self.after.hide()
-        self.saves_notice.hide()
         ss.status.setText("Backing up your saves and switching your mods off" if self.opt("backup_saves")
                           else "Switching your mods off")
         self.run_job(Worker(core.start_search, self.sims_dir, self.opt("clear_cache"), self.opt("backup_saves")),
-                     lambda _: (self.show_current_page(), self.auto_start_game()),
-                     lambda msg: (ss.notice.show_message(msg, "error"), self.show_current_page()))
+                     lambda _: (self.saves_notice.hide(), self.show_current_page(), self.auto_start_game()),
+                     lambda msg: (ss.notice.show_message(msg, "error"),
+                                  self.offer_saves(core.pending_saves(self.sims_dir)), self.show_current_page()))
 
     def answer(self, still_broken: bool) -> None:
+        if self.busy():
+            return
         se = self.search
         se.notice.hide()
         se.status.setText("Setting up the next round")
@@ -1565,7 +1637,11 @@ class MainWindow(QWidget):
         self.run_job(Worker(core.answer_search, self.sims_dir, still_broken, self.opt("clear_cache")), ok, fail)
 
     def end_test(self, remove_found: bool) -> None:
+        if self.busy():
+            return
         page = self.pages.currentWidget()
+        stopped_early = page is self.search and not (self.state and (self.state.get("found") is not None
+                                                                     or self.state.get("not_mods")))
         page.notice.hide()
         page.status.setText("Putting your mods back")
         page.progress.setRange(0, 0)
@@ -1575,18 +1651,20 @@ class MainWindow(QWidget):
             page.progress.hide()
             self.mode_group.button(0 if page is self.testing else 1).setChecked(True)
             self.show_current_page()
-            text = "Your own mods are back."
+            text = ("Search stopped. Your own mods are back; a new search starts from the beginning."
+                    if stopped_early else "Your own mods are back.")
             if result.move_failed:
                 text += (f" The broken mod could not be moved out ({result.move_failed}), so it is still in Mods. "
                          "Move or delete it yourself.")
             elif result.removed:
                 text += f" The broken mod is in \u201c{result.removed.name}\u201d next to Mods."
             elif page is self.testing:
-                text += f" The test copies went to the {platforms.trash_name()}."
+                text += (" The test copies were removed." if result.copies_removed
+                         else f" The test copies went to the {platforms.trash_name()}.")
             if result.added_files:
                 text += (f" {plural(result.added_files, 'file')} {'was' if result.added_files == 1 else 'were'} "
                          "added to the test folders during the test (by the game or by you), for example "
-                         f"households saved to the library. They went to the {platforms.trash_name()} too.")
+                         f"households saved to the library. They went to the {platforms.trash_name()}.")
             if result.leftovers:
                 text += (f" Some test files could not go to the {platforms.trash_name()}. You can delete the folders named "
                          "“test copies” next to Mods.")
@@ -1607,11 +1685,15 @@ class MainWindow(QWidget):
             return
         if len(changed) == 1:
             c = changed[0]
-            text = (f"The game saved over “{Path(c['name']).stem}” during the test ({when(c['saved'])}). "
-                    "Its Sims may be missing CC now.")
+            text = (f"The game saved over \u201c{Path(c['name']).stem}\u201d during the test "
+                    f"({when(c['saved'])}). Its Sims may have lost hair, clothes or furniture from your own CC. "
+                    "Put back the old save to get them back (what you played in the test is lost), or keep "
+                    "the new one.")
             action = "Put back the old save"
         else:
-            text = f"The game saved over {len(changed)} saves during the test. Their Sims may be missing CC now."
+            text = (f"The game saved over {len(changed)} saves during the test. Their Sims may have lost hair, "
+                    "clothes or furniture from your own CC. Put back the old saves to get them back (what you "
+                    "played in the test is lost), or keep the new ones.")
             action = "Put back the old saves"
         self.saves_notice.show_message(text, "warn", action, self.restore_saves,
                                        "Keep the new one" if len(changed) == 1 else "Keep the new ones",
@@ -1622,6 +1704,8 @@ class MainWindow(QWidget):
         self.saves_notice.hide()
 
     def restore_saves(self) -> None:
+        if self.busy():
+            return
         names = [c["name"] for c in core.pending_saves(self.sims_dir)]
 
         def ok(missing: list[str]):
@@ -1707,7 +1791,7 @@ def main() -> int:
     win = MainWindow()
     win.show()
     if os.environ.get("SIMS4MODTEST_SMOKE_TEST"):  # CI: the built app starts, shows its window, quits
-        QTimer.singleShot(3000, win.close)
+        QTimer.singleShot(SMOKE_TEST_CLOSE_MS, win.close)
     code = app.exec()
     if win.watcher.isRunning() or any(job.isRunning() for job in win.side_jobs):
         # A read-only check is still stuck (a very slow network). Python would wait for it or abort

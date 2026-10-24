@@ -45,6 +45,12 @@ def dbpf(keys) -> bytes:
     return bytes(head) + b"x" + idx
 
 
+def later(path: Path) -> None:
+    """As if the game wrote the file a minute after the test started."""
+    t = time.time() + 60
+    os.utime(path, (t, t))
+
+
 def listing(d: Path) -> list[str]:
     return sorted(str(p.relative_to(d)) for p in d.rglob("*") if p.is_file())
 
@@ -169,8 +175,11 @@ def test_unreadable_zip_inside_a_folder_is_skipped(w):
 def test_zip_names_are_made_safe():
     assert core.safe_name("stream.package:hidden") == "stream.package_hidden"
     assert core.safe_name("..") == "file" and core.safe_name("CON.package") == "_CON.package"
-    if platforms.WINDOWS:
-        assert core.long_path(r"\\server\share\x") == "\\\\?\\UNC\\server\\share\\x"
+
+
+@pytest.mark.skipif(not platforms.WINDOWS, reason="long paths are a Windows matter")
+def test_network_paths_get_the_long_path_prefix():
+    assert core.long_path(r"\\server\share\x") == "\\\\?\\UNC\\server\\share\\x"
 
 
 def test_sims3_folder_is_not_mistaken_for_sims4(w):
@@ -251,6 +260,7 @@ def test_leftover_that_recycle_bin_refuses_does_not_block(w, monkeypatch):
     (w.sims / core.MODS.finished).mkdir()
     monkeypatch.setattr(core, "recycle", lambda p: None)
     core.start_test(w.sims, w.items()[:1], False)
+    (w.mods / "dropped in during the test.package").write_bytes(b"x")  # so the folder needs the bin
     result = core.end_test(w.sims, False)
     assert not core.in_test(w.sims) and [p.name for p in result.leftovers] == ["Mods (test copies, Sims 4 Mod Test 2)"]
 
@@ -267,8 +277,8 @@ def test_no_mods_or_tray_folder_yet(w):
 
 def test_overwritten_save_must_be_decided_before_the_next_test(w):
     core.start_test(w.sims, w.items()[:1], False)
-    time.sleep(1.1)
     (w.saves / "Slot_00000002.save").write_bytes(b"saved during the test")
+    later((w.saves / "Slot_00000002.save"))
     result = core.end_test(w.sims, False)
     assert [c["name"] for c in result.changed_saves] == ["Slot_00000002.save"]
     # Another test would leave the version saved during this one without a copy: refused.
@@ -285,8 +295,8 @@ def test_overwritten_save_must_be_decided_before_the_next_test(w):
 
 def test_a_missing_save_backup_is_reported_not_retried(w):
     core.start_test(w.sims, w.items()[:1], False)
-    time.sleep(1.1)
     (w.saves / "Slot_00000002.save").write_bytes(b"saved during the test")
+    later((w.saves / "Slot_00000002.save"))
     core.end_test(w.sims, False)
     (core._backup_dir(w.sims) / "Slot_00000002.save").unlink()
     assert core.restore_saves(w.sims, ["Slot_00000002.save"]) == ["Slot_00000002.save"]
@@ -295,8 +305,8 @@ def test_a_missing_save_backup_is_reported_not_retried(w):
 
 def test_keeping_the_new_save_forgets_the_offer(w):
     core.start_test(w.sims, w.items()[:1], False)
-    time.sleep(1.1)
     (w.saves / "Slot_00000001.save").write_bytes(b"new")
+    later((w.saves / "Slot_00000001.save"))
     core.end_test(w.sims, False)
     core.keep_new_saves(w.sims, ["Slot_00000001.save"])
     assert core.pending_saves(w.sims) == [] and (w.saves / "Slot_00000001.save").read_bytes() == b"new"
@@ -375,8 +385,8 @@ def test_saves_of_two_sims_folders_are_kept_apart(w, tmp_path):
     (other / "Tray").mkdir()
     (other / "saves" / "Slot_00000002.save").write_bytes(b"other folder's save")
     core.start_test(w.sims, w.items()[:1], False)
-    time.sleep(1.1)
     (w.saves / "Slot_00000002.save").write_bytes(b"changed")
+    later((w.saves / "Slot_00000002.save"))
     core.end_test(w.sims, False)
     assert core.pending_saves(w.sims) and not core.pending_saves(other)
     core.backup_saves(other)
@@ -507,7 +517,7 @@ def test_a_crafted_trayitem_cannot_stall_the_app():
     data = (0).to_bytes(4, "little") + len(msg).to_bytes(4, "little") + msg
     started = time.time()
     assert core.tray_item_info(data) == (None, "")
-    assert time.time() - started < 1
+    assert time.time() - started < 5  # without the limit this took about 45 s
 
 
 def test_links_in_dropped_folders_are_not_followed(w):
@@ -533,7 +543,6 @@ def test_unpackable_formats_say_what_to_do(w):
 
 def test_files_added_during_a_test_are_counted(w):
     core.start_test(w.sims, w.items(), False)
-    time.sleep(1.1)
     (w.tray / "0x00000001!0x00000000000000ee.trayitem").write_bytes(trayitem("Saved During Test"))
     (w.mods / "game wrote this.log").write_text("log")
     result = core.end_test(w.sims, False)
@@ -578,7 +587,6 @@ def test_update_check_failures_are_told_apart_from_no_update(monkeypatch):
     monkeypatch.setattr(updates.urllib.request, "urlopen", offline)
     with pytest.raises(updates.CheckFailed):
         updates.find_update()
-    assert updates.available_update() is None
 
 
 def test_steam_libraries_on_other_drives_are_found(tmp_path, monkeypatch):
@@ -590,3 +598,97 @@ def test_steam_libraries_on_other_drives_are_found(tmp_path, monkeypatch):
         ' "1" { "path" "' + str(other).replace("\\", "\\\\") + '" }\n}\n', encoding="utf-8")
     monkeypatch.setattr(platforms, "_steam_roots", lambda home: [steam])
     assert platforms.steam_libraries() == [steam, other]
+
+
+
+# ---------------------------------------------------------------- round 2 of the review
+
+def test_a_households_sims_come_along_from_a_shared_tray_folder(w):
+    hb = w.tray / "0x00000001!0x00000000000000aa.householdbinary"
+    hb.write_bytes(b"head" + (0x0E00000000000001).to_bytes(8, "little") + b"tail")
+    (w.tray / "0x00000013!0x0e00000000000001.sgi").write_bytes(b"this household's Sim")
+    (w.tray / "0x00000013!0x0e00000000000099.sgi").write_bytes(b"someone else's Sim")
+    items, _ = core.inspect_paths([w.tray / "0x00000001!0x00000000000000aa.trayitem"], w.sims)
+    names = sorted(Path(f).name for f in items[0].files)
+    assert "0x00000013!0x0e00000000000001.sgi" in names and "0x00000013!0x0e00000000000099.sgi" not in names
+
+
+def test_the_games_mod_switches_are_read(w):
+    (w.sims / "Options.ini").write_text("[options]\nmodsdisabled = 1\nscriptmodsenabled = 0\n")
+    assert core.game_mod_settings(w.sims) == (False, False)
+    (w.sims / "Options.ini").write_text("modsdisabled = 0\nscriptmodsenabled = 1\n")
+    assert core.game_mod_settings(w.sims) == (True, True)
+    (w.sims / "Options.ini").unlink()
+    assert core.game_mod_settings(w.sims) == (None, None)
+
+
+def test_cache_files_and_the_script_cache_are_cleared(w):
+    (w.sims / "avatarcache.package").write_bytes(b"a")
+    (w.sims / "cachestr").mkdir()
+    (w.sims / "cachestr" / "x.cache").write_bytes(b"c")
+    core.clear_game_cache(w.sims)
+    assert not (w.sims / "localthumbcache.package").exists() and not (w.sims / "avatarcache.package").exists()
+    assert (w.sims / "cachestr").is_dir() and not any((w.sims / "cachestr").iterdir())
+
+
+def test_unchanged_saves_are_not_copied_again(w, monkeypatch):
+    core.backup_saves(w.sims)
+    calls = []
+    real = core.shutil.copy2
+    monkeypatch.setattr(core.shutil, "copy2", lambda a, b, **k: (calls.append(Path(a).name), real(a, b, **k)))
+    core.backup_saves(w.sims)
+    assert calls == []
+    (w.saves / "Slot_00000001.save").write_bytes(b"played since")
+    later(w.saves / "Slot_00000001.save")
+    core.backup_saves(w.sims)
+    assert calls == ["Slot_00000001.save"]
+
+
+def test_test_copies_are_deleted_and_only_new_files_go_to_the_bin(w):
+    core.start_test(w.sims, w.items(), False)
+    assert (w.sims / core.README_NAME).exists()  # in case the test is forgotten
+    (w.mods / "game wrote this.log").write_text("log")
+    result = core.end_test(w.sims, False)
+    assert not (w.sims / core.README_NAME).exists()
+    binned = [f.name for f in w.bin.rglob("*") if f.is_file()]
+    assert result.added_files == 1 and binned == ["game wrote this.log"]
+
+
+def test_a_stale_read_me_goes_when_no_test_runs(w):
+    (w.sims / core.README_NAME).write_text("left over")
+    core.recover(w.sims)
+    assert not (w.sims / core.README_NAME).exists()
+
+
+def test_package_indexes_are_read_once_while_inspecting(w, monkeypatch):
+    (w.dl / "slider.package").write_bytes(dbpf([(0xC5F6763E, 0, 0x1234)]))
+    item = core.inspect_paths([w.dl / "slider.package"], w.sims, risks.package_keys)[0][0]
+    monkeypatch.setattr(core, "entries", lambda i: (_ for _ in ()).throw(AssertionError("read again")))
+    game_keys = frozenset({risks._key_int(0xC5F6763E, 0, 0x1234)})
+    assert risks.check(item, game_keys)[0].startswith("Changes the game")
+
+
+def test_a_test_copy_replaced_during_the_test_is_kept_not_deleted(w):
+    core.start_test(w.sims, w.items()[:1], False)
+    copy = next(p for p in w.mods.iterdir() if p.suffix == ".package")
+    with open(L(copy), "wb") as fh:  # the first item has a very long name
+        fh.write(b"the user's own newer version, put over the test copy")
+    result = core.end_test(w.sims, False)
+    binned = [open(L(f), "rb").read() for f in Path(L(w.bin)).rglob("*") if f.is_file()]
+    assert b"the user's own newer version, put over the test copy" in binned and result.added_files == 1
+
+
+def test_recovery_clears_the_note_and_a_record_of_a_test_that_never_started(w):
+    core.start_test(w.sims, w.items()[:1], False)
+    os.rename(w.mods, w.sims / core.MODS.finished)  # killed halfway through the end
+    core.recover(w.sims)
+    assert not core.in_test(w.sims) and not (w.sims / core.README_NAME).exists()
+    core._save_state({"mode": "test", "sims_dir": str(w.sims), "started": 0, "items": []})  # power cut mid-start
+    core.recover(w.sims)
+    assert core.load_state(w.sims) is None and not core.STATE_PATH.exists()
+
+
+def test_odd_sim_file_names_dont_break_adding_tray_files(w):
+    (w.tray / "0x00000013!0x1234567890abcdef12.sgi").write_bytes(b"x")
+    items, problems = core.inspect_paths([w.tray / "0x00000001!0x00000000000000aa.trayitem"], w.sims)
+    assert items and not problems

@@ -1,16 +1,19 @@
-"""Folder swapping for Sims 4 Mod Test. No Qt in here, so it can be tested on its own.
+"""Everything Sims 4 Mod Test does to files. No Qt in here, so it can be tested on its own.
+
+Sections: reading what the user drops in (mods, folders, zips, tray files), the state of a
+running test, swapping folders, the broken-mod search, save backups, and small helpers.
 
 A test works like this, for Mods and (when the test has tray files) for Tray:
   1. the chosen files are copied into a staging folder next to the live one,
   2. the live folder is renamed to its backup name,
   3. the staging folder is renamed to the live name.
-Ending a test renames the live folder to a "finished" name, the backup back to
-the live name, and sends the finished folder to the Recycle Bin (Trash). The Mods backup
-existing is what "a test is running" means, so the app survives being closed or
-crashing in the middle.
+Ending a test renames the live folder to a "finished" name, the backup back to the live
+name, deletes the copies it made and sends anything else in it (files the game or the user
+added) to the Recycle Bin / Trash. The Mods backup existing is what "a test is running"
+means, so the app survives being closed or crashing in the middle.
 
-A broken-mod search uses the same swap, but each round's Mods folder is made of
-hard links to half of the user's own mods (no copying, no extra disk space).
+A broken-mod search uses the same swap, but each round's Mods folder is made of hard links
+to half of the user's own mods (no copying, no extra disk space).
 """
 from __future__ import annotations
 
@@ -53,7 +56,15 @@ MOD_EXTENSIONS = {".package", ".ts4script"}
 TRAY_EXTENSIONS = {".trayitem", ".householdbinary", ".hhi", ".sgi", ".blueprint", ".bpi", ".room", ".rmi"}
 JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 JUNK_DIRS = {"__macosx"}
-CACHE_FILES = ["localthumbcache.package"]
+# Caches the game rebuilds by itself; stale ones show old thumbnails or old script results.
+CACHE_FILES = ["localthumbcache.package", "localsimtexturecache.package", "avatarcache.package"]
+CACHE_FOLDERS = ["cachestr"]  # their contents go, the folder stays
+README_NAME = "READ ME - Sims 4 Mod Test.txt"
+README_TEXT = (
+    "A Sims 4 Mod Test test is running, so your own mods (and maybe your Tray) are set aside in the\n"
+    "folders whose names end in \"set aside by Sims 4 Mod Test\". The game is loading only the test mods.\n\n"
+    "To get your own mods back, open Sims 4 Mod Test and press \"Restore my mods\".\n"
+    "Please don't move or rename those folders yourself.\n")
 MAX_ZIP_DEPTH = 3  # zips inside zips inside zips
 MAX_ITEM_FILES = 100_000        # one download with more files than this isn't a mod
 MAX_ITEM_BYTES = 50 << 30       # ... nor one that unpacks to more than 50 GB
@@ -152,7 +163,6 @@ class Entry:
     name: str                          # file name only, folders inside zips are dropped
     size: int
     open: Callable[[], BinaryIO]       # only valid until the next entry is taken
-    date: float = 0.0                  # zip members: the date stored in the zip
 
 
 def kind_of(name: str) -> str:
@@ -192,7 +202,7 @@ def _zip_entries(fh: BinaryIO, depth: int = 1) -> Iterator[Entry]:
                 except ZIP_ERRORS:
                     continue
             name = safe_name(Path(info.filename.replace("\\", "/")).name)
-            yield Entry(name, info.file_size, lambda info=info: zf.open(info), zip_date(info))
+            yield Entry(name, info.file_size, lambda info=info: zf.open(info))
             if name.lower().endswith(".zip") and depth < MAX_ZIP_DEPTH:
                 with tempfile.TemporaryFile() as tmp:
                     try:
@@ -231,8 +241,16 @@ def entries(item: ModItem) -> Iterator[Entry]:
             yield Entry(p.name, _size(p), lambda p=p: open(long_path(p), "rb"))
 
 
-def inspect_paths(paths: list[Path], sims_dir: Path | None) -> tuple[list[ModItem], list[str]]:
-    """Turn picked or dropped paths into test items. Returns (items, problems to show)."""
+IndexReader = Callable[[BinaryIO, int], list]  # risks.package_keys
+
+
+def inspect_paths(paths: list[Path], sims_dir: Path | None,
+                  read_index: IndexReader | None = None) -> tuple[list[ModItem], list[str]]:
+    """Turn picked or dropped paths into test items. Returns (items, problems to show).
+
+    With `read_index`, each package's resource keys are collected on the way (in
+    item.package_keys), so checking them against the game later reads nothing again.
+    """
     items: list[ModItem] = []
     problems: list[str] = []
     tray_by_folder: dict[Path, list[Path]] = {}
@@ -243,7 +261,7 @@ def inspect_paths(paths: list[Path], sims_dir: Path | None) -> tuple[list[ModIte
             if os.path.isfile(long_path(path)) and path.suffix.lower() in TRAY_EXTENSIONS:
                 tray_by_folder.setdefault(path.parent, []).append(path)
             else:
-                items.append(_inspect_one(path))
+                items.append(_inspect_one(path, read_index))
         except TesterError as e:
             problems.append(str(e))
         except (OSError, *ZIP_ERRORS) as e:
@@ -267,19 +285,23 @@ def _refuse_live_folders(path: Path, sims_dir: Path | None) -> None:
                               "Pick single items from it instead.")
 
 
-def _inspect_one(path: Path) -> ModItem:
+def _inspect_one(path: Path, read_index: IndexReader | None = None) -> ModItem:
     if os.path.isdir(long_path(path)):
-        return _inspect_container(ModItem(str(path), "folder", 0, 0, 0))
+        return _inspect_container(ModItem(str(path), "folder", 0, 0, 0), read_index)
     if not os.path.isfile(long_path(path)):
         raise TesterError(f"\u201c{path.name}\u201d could not be found.")
     ext = path.suffix.lower()
     if ext == ".package":
-        return ModItem(str(path), "package", 1, 0, _size(path))
+        item = ModItem(str(path), "package", 1, 0, _size(path))
+        if read_index:
+            item.package_keys = set()
+            _collect_keys(item, read_index, lambda: open(long_path(path), "rb"), item.size)
+        return item
     if ext == ".ts4script":
         return ModItem(str(path), "script", 1, 0, _size(path), has_script=True)
     if ext == ".zip":
         try:
-            return _inspect_container(ModItem(str(path), "zip", 0, 0, _size(path)))
+            return _inspect_container(ModItem(str(path), "zip", 0, 0, _size(path)), read_index)
         except zipfile.BadZipFile:
             raise TesterError(f"\u201c{path.name}\u201d is damaged or not a real .zip file.")
         except (NotImplementedError, RuntimeError):
@@ -293,8 +315,18 @@ def _inspect_one(path: Path) -> ModItem:
                       "folders and .zip files work too.")
 
 
-def _inspect_container(item: ModItem) -> ModItem:
+def _collect_keys(item: ModItem, read_index: IndexReader, opener: Callable[[], BinaryIO], size: int) -> None:
+    try:
+        with opener() as fh:
+            item.package_keys.update(read_index(fh, size))
+    except (OSError, *ZIP_ERRORS):
+        pass  # an unreadable package gets its own error when it's copied
+
+
+def _inspect_container(item: ModItem, read_index: IndexReader | None = None) -> ModItem:
     count = 0
+    if read_index:
+        item.package_keys = set()
     for e in entries(item):
         count += 1
         item.unpacked += e.size
@@ -306,6 +338,8 @@ def _inspect_container(item: ModItem) -> ModItem:
         if kind == "mod":
             item.mod_files += 1
             item.has_script |= e.name.lower().endswith(".ts4script")
+            if read_index and e.name.lower().endswith(".package"):
+                _collect_keys(item, read_index, e.open, e.size)
         elif kind == "tray":
             item.tray_files += 1
             if e.name.lower().endswith(".trayitem"):
@@ -325,6 +359,22 @@ def _tray_id(path: Path) -> str:
     return path.stem.split("!")[-1].lower()
 
 
+def _sims_of(group: set[Path], sgis: list[Path]) -> set[Path]:
+    """The .sgi files (one per Sim, named after the Sim id) of the households in `group`: their
+    .householdbinary holds each Sim id as an 8-byte number."""
+    found: set[Path] = set()
+    for hb in (p for p in group if p.suffix.lower() == ".householdbinary"):
+        data = _read(hb, 32 << 20)
+        for sgi in sgis:
+            try:
+                sim_id = int(_tray_id(sgi), 16)
+            except ValueError:
+                continue
+            if 0 <= sim_id < 1 << 64 and sim_id.to_bytes(8, "little") in data:
+                found.add(sgi)
+    return found
+
+
 def _tray_group(folder: Path, picked: list[Path]) -> ModItem:
     """The picked tray files plus the rest of each household, lot or room they belong to."""
     siblings = [folder / e.name for e in os.scandir(long_path(folder))
@@ -335,6 +385,7 @@ def _tray_group(folder: Path, picked: list[Path]) -> ModItem:
     else:
         ids = {_tray_id(p) for p in picked if p.suffix.lower() == ".trayitem"}
         group = set(picked) | {p for p in siblings if _tray_id(p) in ids}
+        group |= _sims_of(group, [p for p in siblings if p.suffix.lower() == ".sgi"])
     files = sorted(group, key=lambda p: (p.suffix.lower() != ".trayitem", p.name))
     infos = [(tray_item_info(_read(p)), p.name) for p in files if p.suffix.lower() == ".trayitem"]
     return ModItem(str(files[0]), "tray", 0, len(files), sum(_size(p) for p in files),
@@ -474,7 +525,7 @@ def _rmtree(path: Path) -> None:
     shutil.rmtree(long_path(path), ignore_errors=True)
 
 
-def _copy_item(item: ModItem, mods: Path, tray: Path) -> None:
+def _copy_item(item: ModItem, mods: Path, tray: Path) -> list[Path]:
     """Copy one item into the test Mods and Tray folders.
 
     Mods from folders and zips are flattened into Mods/<name>/ because the game
@@ -483,15 +534,18 @@ def _copy_item(item: ModItem, mods: Path, tray: Path) -> None:
     (configs, readmes) only come along when there is a script mod that may need them.
     """
     src = Path(item.path)
+    made: list[Path] = []
     if item.kind in ("package", "script"):
-        shutil.copy2(long_path(src), long_path(_unique(mods, src.name)))
-        return
+        dest = _unique(mods, src.name)
+        shutil.copy2(long_path(src), long_path(dest))
+        return [dest]
     if item.kind == "tray":
         for f in item.files:
             dest = tray / Path(f).name
             if not os.path.exists(long_path(dest)):  # same file twice: keep one
                 shutil.copy2(long_path(f), long_path(dest))
-        return
+                made.append(dest)
+        return made
 
     mod_dir: Path | None = None
     for e in entries(item):
@@ -500,11 +554,15 @@ def _copy_item(item: ModItem, mods: Path, tray: Path) -> None:
             dest = tray / e.name
             if not os.path.exists(long_path(dest)):
                 _write(e.open, dest)
+                made.append(dest)
         elif kind == "mod" or (item.has_script and not e.name.lower().endswith(".zip")):
             if mod_dir is None:
                 mod_dir = _unique(mods, src.stem if item.kind == "zip" else src.name)
                 os.mkdir(long_path(mod_dir))
-            _write(e.open, _unique(mod_dir, e.name))
+            dest = _unique(mod_dir, e.name)
+            _write(e.open, dest)
+            made.append(dest)
+    return made
 
 
 # ---------------------------------------------------------------- state
@@ -608,6 +666,10 @@ def recover(sims_dir: Path) -> None:
         if not (sims_dir / slot.backup).exists():
             for folder in finished_folders(sims_dir, slot):
                 recycle(folder)
+    if not in_test(sims_dir):
+        (sims_dir / README_NAME).unlink(missing_ok=True)
+        if load_state(sims_dir) is not None:
+            _save_state(None)  # a record of a test that never started (power cut mid-start)
 
 
 def finished_folders(sims_dir: Path, slot: Slot = MODS) -> list[Path]:
@@ -624,7 +686,8 @@ def glob_escape(text: str) -> str:
 
 def _locked(folder: str) -> TesterError:
     return TesterError(f"Windows would not let Sims 4 Mod Test rename the {folder} folder. A program is still "
-                       "using a file in it, for example Sims 4 Studio or a folder window. Close it and try again.")
+                       "using a file in it, for example OneDrive, Sims 4 Studio or a folder window. Close it "
+                       "(or pause OneDrive syncing) and try again.")
 
 
 def _rename(src: Path, dst: Path) -> None:
@@ -763,11 +826,20 @@ def start_test(sims_dir: Path, items: list[ModItem], clear_cache: bool, back_up_
     total = sum(i.size for i in items) or 1
     done = 0
     mods_staging, tray_staging = sims_dir / MODS.staging, sims_dir / TRAY.staging
+    copied: dict[str, list[list]] = {"Mods": [], "Tray": []}  # [relative path, size, mtime_ns] per copy
+
+    def remember(f: Path) -> None:
+        base, key = (tray_staging, "Tray") if f.is_relative_to(tray_staging) else (mods_staging, "Mods")
+        st = os.stat(long_path(f))
+        copied[key].append([str(f.relative_to(base)), st.st_size, st.st_mtime_ns])
+
     try:
         _resource_cfg(sims_dir / "Mods", mods_staging)
+        remember(mods_staging / "Resource.cfg")
         for item in items:
             try:
-                _copy_item(item, mods_staging, tray_staging)
+                for f in _copy_item(item, mods_staging, tray_staging):
+                    remember(f)
             except (OSError, *ZIP_ERRORS) as e:
                 raise TesterError(f"Could not copy \u201c{item.title}\u201d: {reason(e)}. "
                                   "Nothing was changed.")
@@ -776,7 +848,7 @@ def start_test(sims_dir: Path, items: list[ModItem], clear_cache: bool, back_up_
         saves = backup_saves(sims_dir) if back_up_saves else []
         # Written before anything moves (as for a search), so the record never lags behind the folders.
         _save_state({"mode": "test", "sims_dir": str(sims_dir), "started": time.time(),
-                     "items": items, "saves": saves}, required=True)
+                     "items": items, "saves": saves, "copied": copied}, required=True)
     except BaseException:
         cleanup()
         raise
@@ -803,8 +875,17 @@ def start_test(sims_dir: Path, items: list[ModItem], clear_cache: bool, back_up_
             _save_state(None)
         raise
 
+    _write_readme(sims_dir)
     if clear_cache:
         clear_game_cache(sims_dir)
+
+
+def _write_readme(sims_dir: Path) -> None:
+    """A note next to the set-aside folders, for whoever looks there (or forgot the test)."""
+    try:
+        (sims_dir / README_NAME).write_text(README_TEXT, encoding="utf-8")
+    except OSError:
+        pass
 
 
 @dataclass
@@ -814,6 +895,7 @@ class EndResult:
     removed: Path | None = None           # where a found broken mod was moved to
     move_failed: str | None = None        # why the found mod could not be moved out
     added_files: int = 0                  # files the game or the user put in the test folders
+    copies_removed: bool = False          # the test's own copies were deleted (else they went to the bin)
 
 
 def end_test(sims_dir: Path, clear_cache: bool, remove_found: bool = False) -> EndResult:
@@ -841,31 +923,46 @@ def end_test(sims_dir: Path, clear_cache: bool, remove_found: bool = False) -> E
             move_failed = reason(e)
     _add_pending_saves(sims_dir, changed_saves(sims_dir, state.get("saves", [])))
     _save_state(None)
+    (sims_dir / README_NAME).unlink(missing_ok=True)
     if clear_cache:
         clear_game_cache(sims_dir)
     added = 0
+    copied = state.get("copied")
+    copies_removed = copied is not None and not search
     for folder in leftovers:
         try:
             if search:
                 added += _remove_round(folder)
+            elif copied is not None:
+                live = TRAY.live if folder.name.startswith(TRAY.live) else MODS.live
+                added += _clear_test_folder(folder, copied.get(live, []))
             else:
-                added += _files_added_since(folder, state.get("started", time.time()))
-                recycle(folder)
-        except OSError:
-            pass
-    return EndResult([f for f in leftovers if f.exists()], pending_saves(sims_dir), removed, move_failed, added)
+                recycle(folder)  # no record of what was copied: keep everything recoverable
+        except OSError as e:
+            log_error(f"cleaning up {folder.name}: {e}")
+    return EndResult([f for f in leftovers if f.exists()], pending_saves(sims_dir), removed, move_failed, added,
+                     copies_removed)
 
 
-def _files_added_since(folder: Path, started: float) -> int:
-    """Files written into a test folder after the test began (copies keep older dates)."""
-    n = 0
-    for f in walk_files(Path(long_path(folder))):
+def _clear_test_folder(folder: Path, copied: list[list]) -> int:
+    """Delete the copies this test made (the originals are untouched elsewhere), but only while
+    they are still exactly those copies (same size and date). Anything else in the folder (a
+    household saved to the library, a mod dropped in or replaced during the test, a config a
+    script mod rewrote) goes to the Recycle Bin with the folder. Returns how many such files."""
+    for rel, size, mtime_ns in copied:
+        path = long_path(folder / rel)
         try:
-            if os.stat(f).st_mtime > started:
-                n += 1
+            st = os.stat(path)
+            if st.st_size == size and st.st_mtime_ns == mtime_ns:
+                os.unlink(path)
         except OSError:
             pass
-    return n
+    others = sum(1 for _ in walk_files(Path(long_path(folder))))
+    if others:
+        recycle(folder)
+    else:
+        _rmtree(folder)
+    return others
 
 
 # ---------------------------------------------------------------- broken-mod search
@@ -937,6 +1034,7 @@ def start_search(sims_dir: Path, clear_cache: bool, back_up_saves: bool = True) 
         _rmtree(staging)
         recover(sims_dir)
         raise
+    _write_readme(sims_dir)
     if clear_cache:
         clear_game_cache(sims_dir)
 
@@ -1158,15 +1256,27 @@ def backup_saves(sims_dir: Path) -> list[dict]:
             old.unlink(missing_ok=True)
     info = []
     for p in current:
-        if p.name not in keep or not (folder / p.name).is_file():
-            try:
-                shutil.copy2(p, folder / p.name)
-            except OSError as e:
-                raise TesterError(f"Could not back up your save “{p.stem}”: {reason(e)}. "
-                                  "Nothing was changed.")
+        backup = folder / p.name
+        if p.name not in keep or not backup.is_file():
+            if _same_file(p, backup):
+                pass  # copied before and unchanged since (copy2 keeps the date)
+            else:
+                try:
+                    shutil.copy2(p, backup)
+                except OSError as e:
+                    raise TesterError(f"Could not back up your save “{p.stem}”: {reason(e)}. "
+                                      "Nothing was changed.")
         st = p.stat()
         info.append({"name": p.name, "size": st.st_size, "mtime": st.st_mtime})
     return info
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        sa, sb = a.stat(), b.stat()
+    except OSError:
+        return False
+    return sa.st_size == sb.st_size and abs(sa.st_mtime - sb.st_mtime) < 0.01
 
 
 def changed_saves(sims_dir: Path, before: list[dict]) -> list[dict]:
@@ -1211,10 +1321,51 @@ def restore_saves(sims_dir: Path, names: list[str]) -> list[str]:
 # ---------------------------------------------------------------- misc
 
 def clear_game_cache(sims_dir: Path) -> None:
-    for name in CACHE_FILES:
-        path = sims_dir / name
-        if path.exists():
-            recycle(path)
+    """Best effort: a cache that can't be cleared is left for the game to deal with."""
+    try:
+        targets = [sims_dir / n for n in CACHE_FILES if (sims_dir / n).exists()]
+        for name in CACHE_FOLDERS:
+            if (sims_dir / name).is_dir():
+                targets += list((sims_dir / name).iterdir())
+        for target in targets:
+            recycle(target)
+    except Exception as e:  # noqa: BLE001 - never worth failing a test or a restore over
+        log_error(f"clearing the game's cache: {e!r}")
+
+
+def game_mod_settings(sims_dir: Path) -> tuple[bool | None, bool | None]:
+    """(custom content on, script mods on) from the game's Options.ini, None where unknown.
+    Game updates switch these off; a test with them off shows nothing."""
+    mods_on = scripts_on = None
+    try:
+        text = (sims_dir / "Options.ini").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, None
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key, value = key.strip().lower(), value.strip()
+        if key == "modsdisabled":
+            mods_on = value == "0"
+        elif key == "scriptmodsenabled":
+            scripts_on = value == "1"
+    return mods_on, scripts_on
+
+
+ERROR_LOG_LIMIT = 256 * 1024
+
+
+def log_error(text: str) -> None:
+    """Append to errors.log in the app's data folder (kept short), for bug reports."""
+    log = DATA_DIR / "errors.log"
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        old = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
+        new = (old + f"--- {time.strftime('%Y-%m-%d %H:%M:%S')}\n{text.rstrip()}\n")[-ERROR_LOG_LIMIT:]
+        log.write_text(new, encoding="utf-8")
+    except OSError:
+        pass
 
 
 def new_error_reports(sims_dir: Path, since: float) -> list[Path]:

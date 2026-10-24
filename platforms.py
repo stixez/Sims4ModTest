@@ -165,6 +165,8 @@ def launch_game(game_dir: Path | None) -> bool:
         return QDesktopServices.openUrl(QUrl(f"steam://rungameid/{SIMS4_STEAM_APP_ID}"))
     if game_dir is None:
         return False
+    if "steamapps" in (part.lower() for part in game_dir.parts):  # a Steam copy wants Steam running
+        return QDesktopServices.openUrl(QUrl(f"steam://rungameid/{SIMS4_STEAM_APP_ID}"))
     exe = game_dir / "Game" / "Bin" / "TS4_x64.exe"
     return exe.is_file() and detached(str(exe), [], str(exe.parent))
 
@@ -189,10 +191,10 @@ def recycle(path: Path) -> bool:
     full = os.path.abspath(path)
     if WINDOWS:
         return _recycle_windows(full)
+    from send2trash import send2trash  # a dependency on macOS and Linux: missing is a real bug
     try:
-        from send2trash import send2trash
         send2trash(full)
-    except Exception:
+    except OSError:  # no trash on that drive, no permission
         return False
     return not os.path.lexists(full)
 

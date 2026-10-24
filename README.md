@@ -12,16 +12,19 @@ For Windows, macOS and Linux.
 From [Releases](../../releases/latest):
 
 - **Windows:** `Sims-4-Mod-Test-…-setup.exe`. The installer isn't signed yet, so Windows may say
-  "Windows protected your PC". Click **More info**, then **Run anyway**. There's also a portable zip if you'd
-  rather not install.
-- **macOS** (Apple silicon): `Sims-4-Mod-Test-…-macos.zip`. Unzip it and move the app to Applications. The app
-  isn't signed by Apple, so the first time macOS refuses to open it. Open **System Settings → Privacy &
-  Security**, scroll down and click **Open Anyway** next to Sims 4 Mod Test.
+  "Windows protected your PC". Click **More info**, then **Run anyway**. If Smart App Control blocks it with no
+  such button, use the portable zip instead. The portable zip also works if you'd rather not install.
+- **macOS** (Apple silicon; Intel Macs aren't supported): `Sims-4-Mod-Test-…-macos.zip`. Unzip it and move the app
+  to Applications. The app isn't signed by Apple, so the first time macOS refuses to open it. Open **System
+  Settings → Privacy & Security**, scroll down and click **Open Anyway** next to Sims 4 Mod Test. If macOS says the
+  app "is damaged", run `xattr -dr com.apple.quarantine "/Applications/Sims 4 Mod Test.app"` in Terminal once. If
+  the app can't find your Sims 4 folder, allow it under **Privacy & Security → Files and Folders**.
 - **Linux** (The Sims 4 through Steam with Proton): `Sims-4-Mod-Test-…-linux-x86_64.tar.gz`. Unpack it and run
-  `Sims 4 Mod Test` inside. On a minimal system you may need Qt's libraries first; on Ubuntu or Debian:
-  `sudo apt install libegl1 libxkbcommon-x11-0 libxcb-cursor0 libfontconfig1 libdbus-1-3`.
+  `Sims 4 Mod Test` inside the unpacked folder. On a minimal system you may need Qt's libraries first; on Ubuntu or
+  Debian: `sudo apt install libegl1 libxkbcommon-x11-0 libxcb-cursor0 libfontconfig1 libdbus-1-3`. On a Steam Deck
+  (desktop mode) skip that line; if the app doesn't open, start it from Konsole to see why.
 
-The app tells you when a new version is out.
+The app tells you when a new version is out. Installing a new version over the old one keeps a running test, your settings and your save backups.
 
 ## Test new mods
 
@@ -46,6 +49,8 @@ moves the broken mod to `Mods removed by Sims 4 Mod Test`, so nothing is lost.
 - Files you add are copied, never moved or changed.
 - Your save files are backed up before each test. If the game saved over one, you can put the old one back.
 - If the app or your computer stops halfway, the next start puts your folders back.
+- During a test, a `READ ME - Sims 4 Mod Test.txt` sits in your Sims 4 folder, in case you forget the test is
+  running. Uninstalling isn't possible until you've restored your mods.
 - The Sims 4 folder and the game folder are found by themselves, and you can pick either one in **Settings**.
   Settings also has light and dark mode, and lets you turn the save backup, the thumbnail-cache cleanup, starting
   the game by itself and the update check on or off.

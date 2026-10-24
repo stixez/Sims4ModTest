@@ -100,9 +100,4 @@ def find_update(skipped: str = "", timeout: float = 5.0) -> Release | None:
     return release
 
 
-def available_update(skipped: str = "", timeout: float = 5.0) -> Release | None:
-    """Like find_update, but silent when GitHub can't be asked: the next day tries again."""
-    try:
-        return find_update(skipped, timeout)
-    except CheckFailed:
-        return None
+

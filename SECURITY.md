@@ -8,6 +8,11 @@
 - The app's data folder (`%LOCALAPPDATA%\Sims 4 Mod Test` on Windows, `~/Library/Application Support/Sims 4 Mod
   Test` on macOS, `~/.local/share/Sims 4 Mod Test` on Linux): the state of a running test, save backups and a
   cache of the game's own resource keys.
+- During a test: a `READ ME - Sims 4 Mod Test.txt` note in the Sims 4 folder, removed when the test ends.
+- The game's cache files (`localthumbcache.package`, `localsimtexturecache.package`, `avatarcache.package`, the
+  contents of `cachestr`) go to the Recycle Bin / Trash before and after a test, if that setting is on. The game
+  rebuilds them.
+- `errors.log` in the app's data folder: unexpected errors, for bug reports. It stays on your computer.
 - The game folder: read only, to start the game and to read package indexes.
 
 Once a day the app asks GitHub's public API whether there is a newer release

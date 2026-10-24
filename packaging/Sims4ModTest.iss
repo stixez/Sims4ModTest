@@ -64,3 +64,17 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Open Sims 4 Mod Test now"; Flags: nowait postinstall skipifsilent
+
+[Code]
+// A running test has the user's own Mods set aside; removing the app then would leave them there
+// with nothing on screen saying how to get them back.
+function InitializeUninstall(): Boolean;
+begin
+  Result := True;
+  if FileExists(ExpandConstant('{localappdata}\Sims 4 Mod Test\state.json')) then
+  begin
+    MsgBox('A test is still running, so your own mods are set aside. Open Sims 4 Mod Test and press ' +
+           '"Restore my mods" first, then uninstall.', mbInformation, MB_OK);
+    Result := False;
+  end;
+end;

@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 import struct
+import threading
 import zipfile
 from array import array
 from datetime import datetime
@@ -30,6 +31,7 @@ SLIDER_TYPES = {0xC5F6763E, 0x0355E0A6, 0xB0118C15}  # SMOD (sim modifier), BOND
 WATCHED = SLIDER_TYPES | {CASP}
 GAME_FOLDER_RE = re.compile(r"^(Data|Delta|[EFGS]P\d+)$", re.I)
 INDEX_CACHE = core.DATA_DIR / "game index.bin"
+INDEX_FORMAT = 3  # bump when what the cache holds changes: older caches are then rebuilt
 _COMP_DELETED = 0xFFE0
 
 
@@ -127,9 +129,13 @@ def game_index(game_dir: Path, stop: Callable[[], bool] = lambda: False) -> froz
     if root is None:
         return frozenset()
     version = platforms.game_version_file(game_dir)
-    st = version.stat() if version else root.stat()
-    packs = ",".join(sorted(p.name for p in root.iterdir() if p.is_dir() and GAME_FOLDER_RE.match(p.name)))
-    stamp = f"3|{game_dir}|{st.st_size}|{int(st.st_mtime)}|{packs}".encode("utf-8")
+    try:
+        st = version.stat() if version else root.stat()
+        packs = ",".join(sorted(p.name for p in root.iterdir() if p.is_dir() and GAME_FOLDER_RE.match(p.name)))
+    except OSError as e:
+        core.log_error(f"reading the game folder {game_dir}: {e}")
+        return frozenset()
+    stamp = f"{INDEX_FORMAT}|{game_dir}|{st.st_size}|{int(st.st_mtime)}|{packs}".encode("utf-8")
     try:
         data = INDEX_CACHE.read_bytes()
         head, _, body = data.partition(b"\n")
@@ -159,9 +165,12 @@ def game_index(game_dir: Path, stop: Callable[[], bool] = lambda: False) -> froz
         a.append(k & 0xFFFFFFFFFFFFFFFF)
     try:
         INDEX_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = INDEX_CACHE.with_suffix(".tmp")
-        tmp.write_bytes(stamp + b"\n" + a.tobytes())
-        os.replace(tmp, INDEX_CACHE)
+        tmp = INDEX_CACHE.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")  # two builds can overlap
+        try:
+            tmp.write_bytes(stamp + b"\n" + a.tobytes())
+            os.replace(tmp, INDEX_CACHE)
+        finally:
+            tmp.unlink(missing_ok=True)  # a partial file from a failed write (e.g. a full disk)
     except OSError:
         pass
     return frozenset(keys)
@@ -200,18 +209,22 @@ def check(item: core.ModItem, game_keys: frozenset[int] | None) -> list[str]:
     sliders = cas = 0
     if not game_keys:
         return []
-    try:
-        for e in core.entries(item):
-            if e.name.lower().endswith(".package"):
-                with e.open() as fh:
-                    for t, g, i in package_keys(fh, e.size):
-                        if _key_int(t, g, i) in game_keys:
-                            if t in SLIDER_TYPES:
-                                sliders += 1
-                            else:
-                                cas += 1
-    except (OSError, *core.ZIP_ERRORS):
-        return []  # unreadable items get their own error when copied
+    keys = getattr(item, "package_keys", None)  # read while inspecting: no second pass over the files
+    if keys is None:
+        keys = []
+        try:
+            for e in core.entries(item):
+                if e.name.lower().endswith(".package"):
+                    with e.open() as fh:
+                        keys += package_keys(fh, e.size)
+        except (OSError, *core.ZIP_ERRORS):
+            return []  # unreadable items get their own error when copied
+    for t, g, i in keys:
+        if _key_int(t, g, i) in game_keys:
+            if t in SLIDER_TYPES:
+                sliders += 1
+            else:
+                cas += 1
     warnings = []
     if sliders:
         warnings.append("Changes the game\u2019s own sliders or body shapes. "

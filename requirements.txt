@@ -1,8 +1,5 @@
+# What the app needs to run (these are bundled into the downloads)
 PySide6-Essentials==6.12.0
 psutil==7.2.2
 Send2Trash==2.1.0; sys_platform != "win32"
 certifi==2026.10.23; sys_platform != "win32"
-# building and testing
-pyinstaller==6.22.3
-pytest==9.1.1
-Pillow==13.0.0

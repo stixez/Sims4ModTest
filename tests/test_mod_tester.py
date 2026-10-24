@@ -265,17 +265,32 @@ def test_no_mods_or_tray_folder_yet(w):
 
 # ---------------------------------------------------------------- saves
 
-def test_overwritten_save_can_be_put_back_even_after_another_test(w):
+def test_overwritten_save_must_be_decided_before_the_next_test(w):
     core.start_test(w.sims, w.items()[:1], False)
     time.sleep(1.1)
     (w.saves / "Slot_00000002.save").write_bytes(b"saved during the test")
     result = core.end_test(w.sims, False)
     assert [c["name"] for c in result.changed_saves] == ["Slot_00000002.save"]
-    core.start_test(w.sims, w.items()[:1], False)  # the offer is ignored and another test starts
-    core.end_test(w.sims, False)
-    assert (core._backup_dir(w.sims) / "Slot_00000002.save").read_bytes() == b"save two"
-    core.restore_saves(w.sims, ["Slot_00000002.save"])
+    # Another test would leave the version saved during this one without a copy: refused.
+    with pytest.raises(core.TesterError, match="First choose what to do with the save"):
+        core.start_test(w.sims, w.items()[:1], False)
+    with pytest.raises(core.TesterError, match="First choose what to do with the save"):
+        core.start_search(w.sims, False)
+    assert not core.in_test(w.sims)
+    assert core.restore_saves(w.sims, ["Slot_00000002.save"]) == []
     assert (w.saves / "Slot_00000002.save").read_bytes() == b"save two" and core.pending_saves(w.sims) == []
+    core.start_test(w.sims, w.items()[:1], False)  # decided: a new test may start
+    core.end_test(w.sims, False)
+
+
+def test_a_missing_save_backup_is_reported_not_retried(w):
+    core.start_test(w.sims, w.items()[:1], False)
+    time.sleep(1.1)
+    (w.saves / "Slot_00000002.save").write_bytes(b"saved during the test")
+    core.end_test(w.sims, False)
+    (core._backup_dir(w.sims) / "Slot_00000002.save").unlink()
+    assert core.restore_saves(w.sims, ["Slot_00000002.save"]) == ["Slot_00000002.save"]
+    assert core.pending_saves(w.sims) == [] and (w.saves / "Slot_00000002.save").read_bytes() == b"saved during the test"
 
 
 def test_keeping_the_new_save_forgets_the_offer(w):
@@ -447,3 +462,131 @@ def test_folders_from_the_old_mod_tester_name_are_taken_over(w, tmp_path, monkey
     assert (core.DATA_DIR / "state.json").exists()
     core.end_test(w.sims, False)
     assert (w.mods / "MCCC").is_dir()
+
+
+# ---------------------------------------------------------------- guards and limits
+
+def test_nothing_moves_while_the_game_runs(w, monkeypatch):
+    core.start_test(w.sims, w.items()[:1], False)
+    monkeypatch.setattr(core, "game_running", lambda: True)
+    for call in (lambda: core.end_test(w.sims, False),
+                 lambda: core.restore_saves(w.sims, []),
+                 lambda: core.answer_search(w.sims, True, False)):
+        with pytest.raises(core.TesterError, match="Close The Sims 4"):
+            call()
+    monkeypatch.setattr(core, "game_running", lambda: False)
+    core.end_test(w.sims, False)
+    monkeypatch.setattr(core, "game_running", lambda: True)
+    for call in (lambda: core.start_test(w.sims, w.items()[:1], False), lambda: core.start_search(w.sims, False)):
+        with pytest.raises(core.TesterError, match="Close The Sims 4"):
+            call()
+    assert not core.in_test(w.sims)
+
+
+def test_not_enough_disk_space_is_refused_before_anything_moves(w, monkeypatch):
+    monkeypatch.setattr(core.shutil, "disk_usage", lambda p: shutil._ntuple_diskusage(1, 1, 1000))
+    with pytest.raises(core.TesterError, match="enough free space"):
+        core.start_test(w.sims, w.items(), False)
+    assert not core.in_test(w.sims) and not (w.sims / core.MODS.staging).exists()
+
+
+def test_downloads_that_are_far_too_big_or_compress_absurdly_are_refused(w, monkeypatch):
+    with zipfile.ZipFile(w.dl / "sneaky.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("ok.package", "fine")
+        for n in range(3):  # each under 64 MB but packed 1000s of times over
+            z.writestr(f"zeros{n}.package", b"\0" * (8 << 20))
+    items, _ = core.inspect_paths([w.dl / "sneaky.zip"], w.sims)
+    assert items[0].mod_files == 1
+    monkeypatch.setattr(core, "MAX_ITEM_FILES", 3)
+    _, problems = core.inspect_paths([w.dl / "Rivera.zip"], w.sims)
+    assert problems and "far more than a mod download" in problems[0]
+
+
+def test_a_crafted_trayitem_cannot_stall_the_app():
+    msg = bytes([0x10]) + b"\xff" * 200_000  # field 2 with a never-ending number
+    data = (0).to_bytes(4, "little") + len(msg).to_bytes(4, "little") + msg
+    started = time.time()
+    assert core.tray_item_info(data) == (None, "")
+    assert time.time() - started < 1
+
+
+def test_links_in_dropped_folders_are_not_followed(w):
+    pack = w.dl / "Linked pack"
+    pack.mkdir()
+    (pack / "real.package").write_bytes(b"r")
+    try:
+        os.symlink(w.mods / "root.package", pack / "link.package")
+        os.symlink(w.mods, pack / "loop", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this system doesn't allow creating symlinks")
+    items, problems = core.inspect_paths([pack], w.sims)
+    assert not problems and items[0].mod_files == 1
+
+
+def test_unpackable_formats_say_what_to_do(w):
+    (w.dl / "pack.7z").write_bytes(b"7z")
+    _, problems = core.inspect_paths([w.dl / "pack.7z", w.dl / "notes.txt"], w.sims)
+    assert "Unpack" in problems[0] and ".zip" in problems[0]
+
+
+# ---------------------------------------------------------------- files that appear during a test or round
+
+def test_files_added_during_a_test_are_counted(w):
+    core.start_test(w.sims, w.items(), False)
+    time.sleep(1.1)
+    (w.tray / "0x00000001!0x00000000000000ee.trayitem").write_bytes(trayitem("Saved During Test"))
+    (w.mods / "game wrote this.log").write_text("log")
+    result = core.end_test(w.sims, False)
+    assert result.added_files == 2
+
+
+def test_an_edited_resource_cfg_in_a_round_is_kept_not_deleted(w):
+    core.start_search(w.sims, False)
+    cfg = w.mods / "Resource.cfg"
+    cfg.unlink()  # an editor that saves by replacing the file breaks the hard link
+    cfg.write_text("Priority 500\nPackedFile *.package\n# my edit\n")
+    core.end_test(w.sims, False)
+    kept = [p for p in w.bin.rglob("Resource.cfg") if "my edit" in p.read_text()]
+    assert kept, "the edited file should be in the Recycle Bin, not deleted"
+
+
+def test_config_files_at_the_top_of_mods_are_in_every_round(w):
+    (w.mods / "top_script.ts4script").write_bytes(b"s")
+    (w.mods / "top_script_settings.cfg").write_text("x")
+    core.start_search(w.sims, False)
+    assert (w.mods / "top_script_settings.cfg").exists()  # round 0: all mods off, configs still there
+    core.end_test(w.sims, False)
+    assert (w.mods / "top_script_settings.cfg").read_text() == "x"
+
+
+def test_the_old_data_folder_is_brought_over_even_after_a_failed_first_try(w):
+    old = core.DATA_DIR.parent / "Mod Tester"
+    (old / "save backup").mkdir(parents=True)
+    (old / "pending saves.json").write_text("[]")
+    core.DATA_DIR.mkdir(parents=True, exist_ok=True)  # the new folder exists already
+    core.migrate_data_dir()
+    assert (core.DATA_DIR / "pending saves.json").exists() and (core.DATA_DIR / "save backup").is_dir()
+    assert not old.exists()
+
+
+# ---------------------------------------------------------------- update check and Steam libraries
+
+def test_update_check_failures_are_told_apart_from_no_update(monkeypatch):
+    def offline(*a, **k):
+        raise updates.urllib.error.URLError("offline")
+
+    monkeypatch.setattr(updates.urllib.request, "urlopen", offline)
+    with pytest.raises(updates.CheckFailed):
+        updates.find_update()
+    assert updates.available_update() is None
+
+
+def test_steam_libraries_on_other_drives_are_found(tmp_path, monkeypatch):
+    steam = tmp_path / "Steam"
+    (steam / "steamapps").mkdir(parents=True)
+    other = tmp_path / "Games" / "SteamLibrary"
+    (steam / "steamapps" / "libraryfolders.vdf").write_text(
+        '"libraryfolders"\n{\n "0" { "path" "' + str(steam).replace("\\", "\\\\") + '" }\n'
+        ' "1" { "path" "' + str(other).replace("\\", "\\\\") + '" }\n}\n', encoding="utf-8")
+    monkeypatch.setattr(platforms, "_steam_roots", lambda home: [steam])
+    assert platforms.steam_libraries() == [steam, other]

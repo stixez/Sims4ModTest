@@ -93,7 +93,7 @@ def find_update(skipped: str = "", timeout: float = 5.0) -> Release | None:
         if len(raw) > _MAX_RESPONSE:
             raise CheckFailed("answer too large")
         release = parse_release(json.loads(raw))
-    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+    except (urllib.error.URLError, OSError, ValueError, RecursionError, http.client.HTTPException) as e:
         raise CheckFailed(str(e)) from e
     if release is None or not is_newer(release.version) or release.version == skipped:
         return None

@@ -1,0 +1,37 @@
+name: Something doesn't work
+description: Tell us what happened, so it can be fixed.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: system
+    attributes:
+      label: Your computer
+      options:
+        - Windows
+        - macOS
+        - Linux (Steam with Proton)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Sims 4 Mod Test version
+      description: Shown in Settings, under Updates.
+      placeholder: "1.1.0"
+  - type: input
+    id: game
+    attributes:
+      label: The Sims 4 version
+      description: In the game's main menu, bottom left. Leave empty if you don't know.
+  - type: textarea
+    id: message
+    attributes:
+      label: Message shown by the app
+      description: Copy the exact text of any message, if there was one.

@@ -1,0 +1,5 @@
+# Building and testing (not part of the downloads)
+-r requirements.txt
+pyinstaller==6.22.3
+pytest==9.1.1
+Pillow==13.0.0

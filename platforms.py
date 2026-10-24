@@ -7,6 +7,7 @@ the Wine prefix of Steam app 1222670. Detection is best effort; the user can pic
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -33,8 +34,31 @@ def data_dir() -> Path:
 # ---------------------------------------------------------------- the Sims 4 user folder
 
 def _steam_roots(home: Path) -> list[Path]:
+    if WINDOWS:
+        return [Path(os.environ.get(env, "")) / "Steam" for env in ("ProgramFiles(x86)", "ProgramFiles")
+                if os.environ.get(env)]
     return [home / ".local" / "share" / "Steam", home / ".steam" / "steam",
             home / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam"]
+
+
+_VDF_PATH = re.compile(r'"path"\s+"((?:[^"\\]|\\.)*)"')
+
+
+def steam_libraries(home: Path | None = None) -> list[Path]:
+    """Every Steam library: the Steam folders themselves plus the extra libraries listed in
+    steamapps/libraryfolders.vdf (games installed on another drive)."""
+    libraries: list[Path] = []
+    for root in _steam_roots(home or Path.home()):
+        candidates = [root]
+        try:
+            text = (root / "steamapps" / "libraryfolders.vdf").read_text(encoding="utf-8", errors="replace")
+            candidates += [Path(m.group(1).replace("\\\\", "\\")) for m in _VDF_PATH.finditer(text)]
+        except OSError:
+            pass
+        for c in candidates:
+            if c not in libraries:
+                libraries.append(c)
+    return libraries
 
 
 def documents_folders(qt_documents: Path | None = None) -> list[Path]:
@@ -54,7 +78,7 @@ def documents_folders(qt_documents: Path | None = None) -> list[Path]:
         found.append(home / "Documents")
     else:
         found += [root / "steamapps" / "compatdata" / SIMS4_STEAM_APP_ID / "pfx" / "drive_c" / "users"
-                  / "steamuser" / "Documents" for root in _steam_roots(home)]
+                  / "steamuser" / "Documents" for root in steam_libraries(home)]
         found.append(home / "Documents")
     unique: list[Path] = []
     for f in found:
@@ -83,12 +107,11 @@ def game_dir_candidates() -> list[Path]:
         for env in ("ProgramFiles(x86)", "ProgramFiles"):
             base = os.environ.get(env)
             if base:
-                found += [Path(base) / "EA Games" / "The Sims 4", Path(base) / "Origin Games" / "The Sims 4",
-                          Path(base) / "Steam" / "steamapps" / "common" / "The Sims 4"]
-        return found
+                found += [Path(base) / "EA Games" / "The Sims 4", Path(base) / "Origin Games" / "The Sims 4"]
+        return found + [lib / "steamapps" / "common" / "The Sims 4" for lib in steam_libraries(home)]
     if MACOS:
         return [Path("/Applications/The Sims 4.app"), home / "Applications" / "The Sims 4.app"]
-    return [root / "steamapps" / "common" / "The Sims 4" for root in _steam_roots(home)]
+    return [lib / "steamapps" / "common" / "The Sims 4" for lib in steam_libraries(home)]
 
 
 def game_content_root(game_dir: Path) -> Path | None:

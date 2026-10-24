@@ -20,6 +20,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import tempfile
 import time
 import zipfile
@@ -54,6 +55,9 @@ JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 JUNK_DIRS = {"__macosx"}
 CACHE_FILES = ["localthumbcache.package"]
 MAX_ZIP_DEPTH = 3  # zips inside zips inside zips
+MAX_ITEM_FILES = 100_000        # one download with more files than this isn't a mod
+MAX_ITEM_BYTES = 50 << 30       # ... nor one that unpacks to more than 50 GB
+SPACE_MARGIN = 500 << 20        # keep this much disk free after copying a test
 
 DEFAULT_RESOURCE_CFG = (
     "Priority 500\n"
@@ -130,6 +134,7 @@ class ModItem:
     files: list[str] = field(default_factory=list)       # kind "tray": every file of the group
     has_script: bool = False  # folders/zips: configs next to a script mod come along too
     warnings: list[str] = field(default_factory=list)    # filled in by risks.check
+    unpacked: int = 0         # bytes it takes once copied (zips: unpacked); 0 = same as size
 
     @property
     def name(self) -> str:
@@ -200,8 +205,10 @@ def _zip_entries(fh: BinaryIO, depth: int = 1) -> Iterator[Entry]:
 
 
 def _looks_like_bomb(info: zipfile.ZipInfo) -> bool:
-    """A member that would unpack to something huge from almost nothing (a zip bomb)."""
-    return info.file_size > (64 << 20) and info.file_size > 200 * max(info.compress_size, 1)
+    """A member that would unpack to something huge from almost nothing (a zip bomb). Real CC
+    packages are already compressed inside, so they shrink little in a zip."""
+    ratio = info.file_size / max(info.compress_size, 1)
+    return (info.file_size > (1 << 20) and ratio > 1000) or (info.file_size > (64 << 20) and ratio > 200)
 
 
 def zip_date(info: zipfile.ZipInfo) -> float:
@@ -276,16 +283,25 @@ def _inspect_one(path: Path) -> ModItem:
         except zipfile.BadZipFile:
             raise TesterError(f"\u201c{path.name}\u201d is damaged or not a real .zip file.")
         except (NotImplementedError, RuntimeError):
-            raise TesterError(f"\u201c{path.name}\u201d is packed in a way Sims 4 Mod Test can\u2019t open, or has a "
-                              "password. Unpack it in Windows first, then add what was inside.")
+            raise TesterError(f"“{path.name}” is packed in a way Sims 4 Mod Test can’t open, or has a "
+                              "password. Unpack it with your computer’s own unzip tool first, then add "
+                              "what was inside.")
     if ext in {".rar", ".7z"}:
-        raise TesterError(f"Unpack \u201c{path.name}\u201d first, then add what was inside. "
-                          "Sims 4 Mod Test can only open .zip files.")
-    raise TesterError(f"\u201c{path.name}\u201d is not a mod or tray file.")
+        raise TesterError(f"Unpack “{path.name}” first (for example with 7-Zip or The Unarchiver), "
+                          "then add what was inside. Sims 4 Mod Test can only open .zip files.")
+    raise TesterError(f"“{path.name}” is not a mod or tray file. Mods end in .package or .ts4script; "
+                      "folders and .zip files work too.")
 
 
 def _inspect_container(item: ModItem) -> ModItem:
+    count = 0
     for e in entries(item):
+        count += 1
+        item.unpacked += e.size
+        if count > MAX_ITEM_FILES or item.unpacked > MAX_ITEM_BYTES:
+            raise TesterError(f"“{item.name}” holds far more than a mod download would "
+                              f"(over {MAX_ITEM_FILES:,} files or {MAX_ITEM_BYTES >> 30} GB), "
+                              "so Sims 4 Mod Test won’t open it.")
         kind = kind_of(e.name)
         if kind == "mod":
             item.mod_files += 1
@@ -333,13 +349,14 @@ def tray_item_info(data: bytes) -> tuple[str | None, str]:
     """(name, kind) of a .trayitem: fields 4 and 2 of the game's TrayMetadata message."""
     def varint(i: int) -> tuple[int, int]:
         result = shift = 0
-        while True:
+        while shift < 70:
             b = msg[i]
             i += 1
             result |= (b & 0x7F) << shift
             shift += 7
             if b < 0x80:
                 return result, i
+        raise IndexError("varint too long")
     name, kind = None, ""
     try:
         length = int.from_bytes(data[4:8], "little")
@@ -389,12 +406,28 @@ def mtime(path: Path) -> float:
         return 0.0
 
 
+def is_link(path: Path) -> bool:
+    """A symlink, or a Windows junction (os.walk follows those)."""
+    return os.path.islink(path) or (hasattr(os.path, "isjunction") and os.path.isjunction(path))
+
+
+def is_regular_file(path: Path) -> bool:
+    """A real file: not a link that could point anywhere, not a device or pipe."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
 def walk_files(root: Path) -> Iterator[Path]:
+    """Regular files under root. Links and junctions are not followed: a link in a download
+    could point at a system file, a device, or back up the tree forever."""
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d.lower() not in JUNK_DIRS]
+        here = Path(dirpath)
+        dirnames[:] = [d for d in dirnames if d.lower() not in JUNK_DIRS and not is_link(here / d)]
         for name in filenames:
-            if name.lower() not in JUNK_NAMES:
-                yield Path(dirpath) / name
+            if name.lower() not in JUNK_NAMES and is_regular_file(here / name):
+                yield here / name
 
 
 def _zip_members(zf: zipfile.ZipFile) -> Iterator[zipfile.ZipInfo]:
@@ -529,11 +562,20 @@ def migrate_data_dir() -> None:
     """Move the old app's data folder (state of a running test, save backups) to the new name.
     Runs before anything else creates the new folder."""
     old_data = DATA_DIR.parent / "Mod Tester"
-    if old_data.is_dir() and not DATA_DIR.exists():
-        try:
+    if not old_data.is_dir():
+        return
+    try:
+        if not DATA_DIR.exists():
             os.rename(old_data, DATA_DIR)
-        except OSError:
-            pass
+            return
+        # The new folder exists already (an earlier move failed, e.g. the old one was open in a
+        # folder window): bring over what it doesn't have, then drop the old folder if empty.
+        for child in old_data.iterdir():
+            if not (DATA_DIR / child.name).exists():
+                os.rename(child, DATA_DIR / child.name)
+        old_data.rmdir()
+    except OSError:
+        pass  # tried again on the next start
 
 
 def _migrate_old_names(sims_dir: Path) -> None:
@@ -679,6 +721,11 @@ def _begin(sims_dir: Path) -> None:
     recover(sims_dir)
     if in_test(sims_dir):
         raise TesterError("A test is already running.")
+    if pending_saves(sims_dir):
+        # Its backup is the good version; a new test would leave the version saved in the
+        # last test without a copy, and a third save would overwrite it.
+        raise TesterError("First choose what to do with the save the game wrote during the last test: "
+                          "put the old one back, or keep the new one.")
 
 
 def _resource_cfg(source_mods: Path, staging: Path, link: bool = False) -> None:
@@ -695,6 +742,12 @@ def start_test(sims_dir: Path, items: list[ModItem], clear_cache: bool, back_up_
         raise TesterError("Add at least one mod to test.")
     _begin(sims_dir)
     slots = [MODS] + ([TRAY] if any(i.tray_files for i in items) else [])
+    needed = sum(i.unpacked or i.size for i in items) + SPACE_MARGIN
+    free = shutil.disk_usage(sims_dir).free
+    if free < needed:
+        raise TesterError(f"There isn’t enough free space for this test: it needs about "
+                          f"{needed / (1 << 30):.1f} GB and {free / (1 << 30):.1f} GB is free. Free up some "
+                          "space, or test fewer mods at once.")
 
     stagings = [sims_dir / s.staging for s in slots]
     for staging in stagings:
@@ -721,6 +774,9 @@ def start_test(sims_dir: Path, items: list[ModItem], clear_cache: bool, back_up_
             done += item.size
             progress(min(done, total), total)
         saves = backup_saves(sims_dir) if back_up_saves else []
+        # Written before anything moves (as for a search), so the record never lags behind the folders.
+        _save_state({"mode": "test", "sims_dir": str(sims_dir), "started": time.time(),
+                     "items": items, "saves": saves}, required=True)
     except BaseException:
         cleanup()
         raise
@@ -743,10 +799,10 @@ def start_test(sims_dir: Path, items: list[ModItem], clear_cache: bool, back_up_
             recover(sims_dir)
         except (OSError, TesterError):
             pass  # the app runs recover() again on its next start
+        if not in_test(sims_dir):
+            _save_state(None)
         raise
 
-    _save_state({"mode": "test", "sims_dir": str(sims_dir), "started": time.time(),
-                 "items": items, "saves": saves})
     if clear_cache:
         clear_game_cache(sims_dir)
 
@@ -757,6 +813,7 @@ class EndResult:
     changed_saves: list[dict]             # saves the game wrote during a test (all not put back yet)
     removed: Path | None = None           # where a found broken mod was moved to
     move_failed: str | None = None        # why the found mod could not be moved out
+    added_files: int = 0                  # files the game or the user put in the test folders
 
 
 def end_test(sims_dir: Path, clear_cache: bool, remove_found: bool = False) -> EndResult:
@@ -786,15 +843,29 @@ def end_test(sims_dir: Path, clear_cache: bool, remove_found: bool = False) -> E
     _save_state(None)
     if clear_cache:
         clear_game_cache(sims_dir)
+    added = 0
     for folder in leftovers:
         try:
             if search:
-                _remove_round(folder)
+                added += _remove_round(folder)
             else:
+                added += _files_added_since(folder, state.get("started", time.time()))
                 recycle(folder)
         except OSError:
             pass
-    return EndResult([f for f in leftovers if f.exists()], pending_saves(sims_dir), removed, move_failed)
+    return EndResult([f for f in leftovers if f.exists()], pending_saves(sims_dir), removed, move_failed, added)
+
+
+def _files_added_since(folder: Path, started: float) -> int:
+    """Files written into a test folder after the test began (copies keep older dates)."""
+    n = 0
+    for f in walk_files(Path(long_path(folder))):
+        try:
+            if os.stat(f).st_mtime > started:
+                n += 1
+        except OSError:
+            pass
+    return n
 
 
 # ---------------------------------------------------------------- broken-mod search
@@ -812,8 +883,8 @@ def mod_units(mods: Path) -> list[list[str]]:
     units: list[list[str]] = []
     root = Path(long_path(mods))
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames.sort()
         here = Path(dirpath)
+        dirnames[:] = sorted(d for d in dirnames if not is_link(here / d))
         rel = here.relative_to(root)
         if rel != Path(".") and any(f.lower().endswith(".ts4script") for f in filenames):
             files = sorted(str(p.relative_to(root)) for p in walk_files(here))
@@ -822,7 +893,7 @@ def mod_units(mods: Path) -> list[list[str]]:
             dirnames[:] = []
             continue
         for name in sorted(filenames):
-            if kind_of(name) == "mod":
+            if kind_of(name) == "mod" and is_regular_file(here / name):
                 units.append([str(rel / name) if rel != Path(".") else name])
     return units
 
@@ -937,26 +1008,31 @@ def _round_intact(mods: Path, units: list[list[str]], testing: list[int]) -> boo
     return True
 
 
-def _remove_round(folder: Path) -> None:
+def _remove_round(folder: Path) -> int:
     """Delete a search round's Mods folder: its hard links go, the user's own files are elsewhere.
 
     Anything that isn't a link (a file the game or the user put there during the
     round) goes to the Recycle Bin with the folder instead of being deleted.
+    Returns how many such files there were.
     """
     root = Path(long_path(folder))
-    others = False
+    others = 0
     for f in walk_files(root):
         try:
-            if os.stat(f).st_nlink > 1 or (f.name == "Resource.cfg" and f.parent == root):
+            ours = os.stat(f).st_nlink > 1 or (
+                f.name == "Resource.cfg" and f.parent == root
+                and f.read_bytes() == DEFAULT_RESOURCE_CFG.encode("ascii"))
+            if ours:
                 os.unlink(f)
             else:
-                others = True
+                others += 1
         except OSError:
-            others = True
+            others += 1
     if others:
         recycle(folder)
     else:
         _rmtree(folder)
+    return others
 
 
 def _build_round(source: Path, staging: Path, units: list[list[str]], testing: list[int]) -> None:
@@ -964,6 +1040,10 @@ def _build_round(source: Path, staging: Path, units: list[list[str]], testing: l
     staging.mkdir()
     try:
         _resource_cfg(source, staging, link=True)
+        with os.scandir(long_path(source)) as it:  # configs next to script mods at the top of Mods
+            for e in it:
+                if e.is_file(follow_symlinks=False) and e.name != "Resource.cfg" and kind_of(e.name) == "other":
+                    os.link(long_path(source / e.name), long_path(staging / e.name))
         made: set[Path] = set()
         for i in testing:
             for rel in units[i]:
@@ -1104,14 +1184,18 @@ def changed_saves(sims_dir: Path, before: list[dict]) -> list[dict]:
     return changed
 
 
-def restore_saves(sims_dir: Path, names: list[str]) -> None:
-    """Put back saves from before the test. The newer versions go to the Recycle Bin."""
+def restore_saves(sims_dir: Path, names: list[str]) -> list[str]:
+    """Put back saves from before the test. The newer versions go to the Recycle Bin.
+    Returns the saves whose backup was missing: those stay as they are and are forgotten."""
     if game_running():
         raise TesterError("Close The Sims 4 before putting saves back.")
+    missing = []
     for name in names:
         src, dest = _backup_dir(sims_dir) / name, sims_dir / "saves" / name
         if not src.is_file():
-            raise TesterError(f"The backup of “{Path(name).stem}” is gone.")
+            missing.append(name)
+            _set_pending(sims_dir, [p for p in pending_saves(sims_dir) if p["name"] != name])
+            continue
         tmp = dest.with_name(dest.name + ".modtester")
         shutil.copy2(src, tmp)
         if dest.exists():
@@ -1121,6 +1205,7 @@ def restore_saves(sims_dir: Path, names: list[str]) -> None:
                                   "is. Close the game and try again.")
         os.replace(tmp, dest)
         _set_pending(sims_dir, [p for p in pending_saves(sims_dir) if p["name"] != name])
+    return missing
 
 
 # ---------------------------------------------------------------- misc

@@ -11,11 +11,15 @@ For Windows, macOS and Linux.
 
 From [Releases](../../releases/latest):
 
-- **Windows:** `Sims-4-Mod-Test-…-setup.exe`. There's also a portable zip if you'd rather not install.
+- **Windows:** `Sims-4-Mod-Test-…-setup.exe`. The installer isn't signed yet, so Windows may say
+  "Windows protected your PC". Click **More info**, then **Run anyway**. There's also a portable zip if you'd
+  rather not install.
 - **macOS** (Apple silicon): `Sims-4-Mod-Test-…-macos.zip`. Unzip it and move the app to Applications. The app
-  isn't signed by Apple, so the first time, right-click it and choose **Open**.
-- **Linux** (Steam with Proton): `Sims-4-Mod-Test-…-linux-x86_64.tar.gz`. Unpack it and run `Sims 4 Mod Test`
-  inside.
+  isn't signed by Apple, so the first time macOS refuses to open it. Open **System Settings → Privacy &
+  Security**, scroll down and click **Open Anyway** next to Sims 4 Mod Test.
+- **Linux** (The Sims 4 through Steam with Proton): `Sims-4-Mod-Test-…-linux-x86_64.tar.gz`. Unpack it and run
+  `Sims 4 Mod Test` inside. On a minimal system you may need Qt's libraries first; on Ubuntu or Debian:
+  `sudo apt install libegl1 libxkbcommon-x11-0 libxcb-cursor0 libfontconfig1 libdbus-1-3`.
 
 The app tells you when a new version is out.
 
@@ -45,13 +49,14 @@ moves the broken mod to `Mods removed by Sims 4 Mod Test`, so nothing is lost.
 - The Sims 4 folder and the game folder are found by themselves, and you can pick either one in **Settings**.
   Settings also has light and dark mode, and lets you turn the save backup, the thumbnail-cache cleanup, starting
   the game by itself and the update check on or off.
-- See [SECURITY.md](SECURITY.md) for exactly what the app touches.
+- Uninstalling leaves the app's data folder (with your save backups) in place; Settings → About opens it. See
+  [SECURITY.md](SECURITY.md) for exactly what the app touches.
 
 ## Build it yourself
 
 ```
 python -m venv .venv
-.venv/Scripts/pip install -r requirements.txt      # macOS/Linux: .venv/bin/pip
+.venv/Scripts/pip install -r requirements-dev.txt      # macOS/Linux: .venv/bin/pip
 python -m pytest -q tests
 python packaging/build.py
 ```
@@ -60,4 +65,8 @@ The Windows installer needs [Inno Setup 6](https://jrsoftware.org/isinfo.php).
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). The downloads include other open source parts under their own licenses; see
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+Sims 4 Mod Test is a fan-made tool. It is not made by, affiliated with or endorsed by Electronic Arts or Maxis.
+The Sims is a trademark of Electronic Arts Inc.

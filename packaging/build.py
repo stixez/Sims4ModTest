@@ -41,7 +41,7 @@ def version_file(path: Path) -> Path:
     StringStruct('FileDescription', '{NAME}'),
     StringStruct('FileVersion', '{__version__}'),
     StringStruct('InternalName', '{NAME}'),
-    StringStruct('LegalCopyright', 'MIT License'),
+    StringStruct('LegalCopyright', 'Copyright (c) 2026 stixez. MIT License'),
     StringStruct('OriginalFilename', '{NAME}.exe'),
     StringStruct('ProductName', '{NAME}'),
     StringStruct('ProductVersion', '{__version__}')])]),
@@ -59,6 +59,11 @@ def build_app() -> None:
     args = [str(ROOT / "app.py"), "--name", NAME, "--windowed", "--noconfirm", "--clean",
             "--distpath", str(DIST), "--workpath", str(work / "pyinstaller"), "--specpath", str(work),
             "--paths", str(ROOT)]
+    # Our license, the third-party notices and their license texts go into every download.
+    sep = ";" if sys.platform == "win32" else ":"
+    for name in ("LICENSE", "THIRD-PARTY-NOTICES.md"):
+        args += ["--add-data", f"{ROOT / name}{sep}."]
+    args += ["--add-data", f"{ROOT / 'licenses'}{sep}licenses"]
     if sys.platform == "win32":
         args += ["--icon", str(ROOT / "assets" / "icon.ico"),
                  "--version-file", str(version_file(work / "version_info.txt"))]

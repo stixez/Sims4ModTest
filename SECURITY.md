@@ -11,13 +11,16 @@
 - The game folder: read only, to start the game and to read package indexes.
 
 Once a day the app asks GitHub's public API whether there is a newer release
-(`api.github.com/repos/stixez/Sims4ModTest/releases/latest`). Nothing about you or your files is sent, and nothing
-is downloaded or installed by itself: you choose whether to open the download. Apart from that, and the "Buy me a
+(`api.github.com/repos/stixez/Sims4ModTest/releases/latest`). GitHub sees that request like any web request (for
+example your IP address), but nothing about your files or your game is sent, and nothing is downloaded or
+installed by itself: you choose whether to open the download. It can be turned off in Settings. Apart from that, and the "Buy me a
 coffee" page when you click it, the app doesn't go online. It doesn't run anything from the mods it copies.
 
 Files from `.zip` downloads are written by their file name only, with characters that are special to the file
 system removed, so a zip can't place files outside the test folder. Members that would unpack to something huge
-from almost nothing (zip bombs) are skipped. Names read from downloaded Sims are shown as plain text.
+from almost nothing (zip bombs) are skipped, and a download that would unpack to more than 50 GB or 100,000 files
+is refused. Links inside dropped folders (symlinks, junctions) are not followed. Names read from downloaded Sims
+are shown as plain text.
 
 ## Reporting a problem
 

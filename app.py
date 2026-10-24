@@ -791,7 +791,6 @@ class SettingsPage(QWidget):
         arow.addWidget(self.data_btn)
         arow.addWidget(self.licenses_btn)
         arow.addStretch(1)
-        arow.addWidget(coffee_button())
         about.addLayout(arow)
         lay.addStretch(1)
 

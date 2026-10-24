@@ -3,6 +3,7 @@ in the background. Nothing is downloaded or installed: the app offers the downlo
 system and the user decides. Nothing about the user is sent."""
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import ssl
@@ -77,19 +78,31 @@ def _tls_context() -> ssl.SSLContext:
         return ssl.create_default_context()
 
 
-def available_update(skipped: str = "", timeout: float = 8.0) -> Release | None:
-    """A release newer than this one that the user hasn't said "not now" to, or None.
-    Offline, rate limited or private repo: silently None, the next day tries again."""
+class CheckFailed(Exception):
+    """GitHub couldn't be asked: offline, rate limited, a private repo, or a broken answer."""
+
+
+def find_update(skipped: str = "", timeout: float = 8.0) -> Release | None:
+    """A release newer than this one that the user hasn't said "not now" to, or None if there
+    is none. Raises CheckFailed when it can't tell."""
     request = urllib.request.Request(LATEST_API, headers={
         "Accept": "application/vnd.github+json", "User-Agent": f"Sims4ModTest/{__version__}"})
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=_tls_context()) as response:
             raw = response.read(_MAX_RESPONSE + 1)
         if len(raw) > _MAX_RESPONSE:
-            return None
+            raise CheckFailed("answer too large")
         release = parse_release(json.loads(raw))
-    except (urllib.error.URLError, OSError, ValueError):
-        return None
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+        raise CheckFailed(str(e)) from e
     if release is None or not is_newer(release.version) or release.version == skipped:
         return None
     return release
+
+
+def available_update(skipped: str = "", timeout: float = 8.0) -> Release | None:
+    """Like find_update, but silent when GitHub can't be asked: the next day tries again."""
+    try:
+        return find_update(skipped, timeout)
+    except CheckFailed:
+        return None

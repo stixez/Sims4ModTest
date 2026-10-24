@@ -42,7 +42,9 @@ moves the broken mod to `Mods removed by Sims 4 Mod Test`, so nothing is lost.
 - Files you add are copied, never moved or changed.
 - Your save files are backed up before each test. If the game saved over one, you can put the old one back.
 - If the app or your computer stops halfway, the next start puts your folders back.
-- The Sims 4 folder and the game folder are found by themselves, and you can pick either one with **Change**.
+- The Sims 4 folder and the game folder are found by themselves, and you can pick either one in **Settings**.
+  Settings also has light and dark mode, and lets you turn the save backup, the thumbnail-cache cleanup, starting
+  the game by itself and the update check on or off.
 - See [SECURITY.md](SECURITY.md) for exactly what the app touches.
 
 ## Build it yourself

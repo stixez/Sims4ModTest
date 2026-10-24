@@ -20,7 +20,7 @@ import zipfile
 from array import array
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 import core
 import platforms
@@ -120,8 +120,9 @@ def _key_int(t: int, g: int, i: int) -> int:
     return (t << 96) | (g << 64) | i
 
 
-def game_index(game_dir: Path) -> frozenset[int]:
-    """Keys of every CAS part and slider in the game's own packages, cached per game version."""
+def game_index(game_dir: Path, stop: Callable[[], bool] = lambda: False) -> frozenset[int] | None:
+    """Keys of every CAS part and slider in the game's own packages, cached per game version.
+    None if `stop` said to give up (the app is closing); nothing is cached then."""
     root = platforms.game_content_root(game_dir)
     if root is None:
         return frozenset()
@@ -144,6 +145,8 @@ def game_index(game_dir: Path) -> frozenset[int]:
         if not (top.is_dir() and GAME_FOLDER_RE.match(top.name)):
             continue
         for pkg in top.rglob("*.package"):
+            if stop():
+                return None
             try:
                 with open(pkg, "rb") as fh:
                     for t, g, i in package_keys(fh, os.fstat(fh.fileno()).st_size):

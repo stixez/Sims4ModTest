@@ -689,7 +689,7 @@ def _resource_cfg(source_mods: Path, staging: Path, link: bool = False) -> None:
         (staging / "Resource.cfg").write_text(DEFAULT_RESOURCE_CFG, encoding="ascii")
 
 
-def start_test(sims_dir: Path, items: list[ModItem], clear_cache: bool,
+def start_test(sims_dir: Path, items: list[ModItem], clear_cache: bool, back_up_saves: bool = True,
                progress: Callable[[int, int], None] = lambda done, total: None) -> None:
     if not items:
         raise TesterError("Add at least one mod to test.")
@@ -720,7 +720,7 @@ def start_test(sims_dir: Path, items: list[ModItem], clear_cache: bool,
                                   "Nothing was changed.")
             done += item.size
             progress(min(done, total), total)
-        saves = backup_saves(sims_dir)
+        saves = backup_saves(sims_dir) if back_up_saves else []
     except BaseException:
         cleanup()
         raise
@@ -839,7 +839,7 @@ def rounds_left(candidates: int) -> int:
     return max(0, math.ceil(math.log2(candidates))) if candidates > 1 else 0
 
 
-def start_search(sims_dir: Path, clear_cache: bool) -> None:
+def start_search(sims_dir: Path, clear_cache: bool, back_up_saves: bool = True) -> None:
     _begin(sims_dir)
     mods = sims_dir / "Mods"
     if not mods.is_dir():
@@ -852,7 +852,7 @@ def start_search(sims_dir: Path, clear_cache: bool) -> None:
         raise TesterError(f"Delete the folder “{staging.name}”, then try again.")
     try:
         _build_round(mods, staging, units, [])
-        saves = backup_saves(sims_dir)
+        saves = backup_saves(sims_dir) if back_up_saves else []
         _save_state({"mode": "search", "sims_dir": str(sims_dir), "started": time.time(), "round": 0,
                      "units": units, "candidates": list(range(len(units))), "testing": [],
                      "found": None, "not_mods": False, "saves": saves}, required=True)

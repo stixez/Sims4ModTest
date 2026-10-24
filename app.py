@@ -73,7 +73,12 @@ def svg_pixmap(svg: str, size: int, ratio: float = 2.0) -> QPixmap:
     return pm
 
 
+_appearance = "system"  # "system", "light" or "dark" (Settings)
+
+
 def current_theme() -> dict:
+    if _appearance in ("light", "dark"):
+        return LIGHT if _appearance == "light" else DARK
     scheme = QGuiApplication.styleHints().colorScheme()
     return DARK if scheme == Qt.ColorScheme.Dark else LIGHT
 
@@ -226,9 +231,16 @@ def _tray_phrase(names: list[str], kinds: list[str]) -> str:
     return " and ".join(f"the {k} “{n}”" if k else f"“{n}”" for n, k in zip(names, kinds))
 
 
-SAVE_WARNING = ("Don’t save your usual households during the test. Without your own CC they lose hair, "
-                "clothes and furniture. Sims 4 Mod Test keeps a copy of your saves from before the test, "
-                "so you can put them back afterwards.")
+def save_warning(backed_up: bool) -> str:
+    text = ("Don\u2019t save your usual households during the test. Without your own CC they lose hair, "
+            "clothes and furniture.")
+    if backed_up:
+        text += " Sims 4 Mod Test keeps a copy of your saves from before the test, so you can put them back afterwards."
+    else:
+        text += " Your saves are not backed up (see Settings), so quit without saving."
+    return text
+
+
 
 
 # ---------------------------------------------------------------- small widgets
@@ -248,6 +260,15 @@ def button(text: str, role: str | None = None) -> QPushButton:
         btn.setProperty("role", role)
     btn.setCursor(Qt.PointingHandCursor)
     btn.setFocusPolicy(Qt.TabFocus)  # focus ring for keyboard users, not after every click
+    return btn
+
+
+def coffee_button() -> QPushButton:
+    btn = button("Buy me a coffee", "coffee")
+    btn.setIcon(QIcon(svg_pixmap(ICON_CUP, 16)))
+    btn.setToolTip(f"Sims 4 Mod Test is free. If it helps you, you can support it: {SUPPORT_URL}")
+    btn.setAccessibleName("Buy me a coffee (opens buymeacoffee.com)")
+    btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(SUPPORT_URL)))
     return btn
 
 
@@ -532,7 +553,7 @@ class SearchSetupPage(QWidget):
         self.count = label("", wrap=True)
         lay.addWidget(self.count)
         self.save_warning = Notice("warn")
-        self.save_warning.show_message(SAVE_WARNING)
+        self.save_warning.show_message(save_warning(True))
         lay.addWidget(self.save_warning)
         self.notice = Notice("error")
         lay.addWidget(self.notice)
@@ -557,7 +578,7 @@ class TestingPage(QWidget):
         self.body = label("", "muted", wrap=True)
         lay.addWidget(self.body)
         self.save_warning = Notice("warn")
-        self.save_warning.show_message(SAVE_WARNING)
+        self.save_warning.show_message(save_warning(True))
         lay.addWidget(self.save_warning)
         self.errors = Notice("error")
         lay.addWidget(self.errors)
@@ -613,7 +634,7 @@ class SearchPage(QWidget):
         lay.addWidget(self.found)
 
         self.save_warning = Notice("warn")
-        self.save_warning.show_message(SAVE_WARNING)
+        self.save_warning.show_message(save_warning(True))
         lay.addWidget(self.save_warning)
         self.errors = Notice("error")
         lay.addWidget(self.errors)
@@ -656,6 +677,138 @@ class SearchPage(QWidget):
         lay.addLayout(bottom)
 
 
+class SettingsPage(QWidget):
+    """Folders, appearance, what happens around a test, updates, and about."""
+
+    def __init__(self):
+        super().__init__()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        body = QWidget()
+        body.setObjectName("listContent")
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(0, 0, 8, 0)
+        lay.setSpacing(8)
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+
+        self.notice = Notice("warn")
+        lay.addWidget(self.notice)
+
+        lay.addWidget(label("Folders", "section"))
+        folders = self._card(lay)
+        self.sims_path, self.change_sims_btn = self._folder_row(folders, "Sims 4 folder", "Choose the Sims 4 folder")
+        self.game_path, self.change_game_btn = self._folder_row(folders, "Game folder", "Choose the game folder")
+        lay.addSpacing(10)
+
+        lay.addWidget(label("Appearance", "section"))
+        seg = QFrame()
+        seg.setObjectName("segments")
+        sl = QHBoxLayout(seg)
+        sl.setContentsMargins(3, 3, 3, 3)
+        sl.setSpacing(2)
+        self.appearance = QButtonGroup(self)
+        for i, text in enumerate(("Match system", "Light", "Dark")):
+            b = button(text, "segment")
+            b.setCheckable(True)
+            self.appearance.addButton(b, i)
+            sl.addWidget(b)
+        row = QHBoxLayout()
+        row.addWidget(seg)
+        row.addStretch(1)
+        lay.addLayout(row)
+        lay.addSpacing(10)
+
+        lay.addWidget(label("During a test", "section"))
+        test_card = self._card(lay)
+        self.backup_saves = self._toggle(
+            test_card, "Back up my saves first",
+            "If the game saves over one of your saves during a test, you can put the old one back. "
+            "Turn this off if your saves are very large.")
+        self.clear_cache = self._toggle(
+            test_card, "Clear the game’s thumbnail cache",
+            "Before and after each test, so new CC shows the right pictures. The game rebuilds it.")
+        self.auto_start = self._toggle(
+            test_card, "Start The Sims 4 when a test is ready", "Also for each round of a broken-mod search.")
+        lay.addSpacing(10)
+
+        lay.addWidget(label("Updates", "section"))
+        upd = self._card(lay)
+        self.check_updates = self._toggle(upd, "Look for a new version once a day",
+                                          "Asks GitHub. Nothing about you is sent, and nothing installs by itself.")
+        urow = QHBoxLayout()
+        urow.setContentsMargins(16, 4, 16, 12)
+        self.version_label = label(f"You have version {__version__}.", "muted")
+        urow.addWidget(self.version_label, 1)
+        self.check_now_btn = button("Check now")
+        urow.addWidget(self.check_now_btn)
+        upd.addLayout(urow)
+        lay.addSpacing(10)
+
+        lay.addWidget(label("About", "section"))
+        about = self._card(lay)
+        text = label("Sims 4 Mod Test is free and open source (MIT license). Your own mods are only ever set "
+                     "aside, never changed.", "muted", wrap=True)
+        text.setContentsMargins(16, 12, 16, 4)
+        about.addWidget(text)
+        arow = QHBoxLayout()
+        arow.setContentsMargins(16, 4, 16, 12)
+        arow.setSpacing(8)
+        self.project_btn = button("Project page")
+        self.data_btn = button("Open the app’s data folder")
+        self.data_btn.setToolTip("Save backups and the state of a running test live here.")
+        arow.addWidget(self.project_btn)
+        arow.addWidget(self.data_btn)
+        arow.addStretch(1)
+        arow.addWidget(coffee_button())
+        about.addLayout(arow)
+        lay.addStretch(1)
+
+    @staticmethod
+    def _card(parent: QVBoxLayout) -> QVBoxLayout:
+        card = QFrame()
+        card.setObjectName("card")
+        inner = QVBoxLayout(card)
+        inner.setContentsMargins(0, 4, 0, 4)
+        inner.setSpacing(0)
+        parent.addWidget(card)
+        return inner
+
+    @staticmethod
+    def _folder_row(card: QVBoxLayout, title: str, accessible: str) -> tuple[ElidedLabel, QPushButton]:
+        row = QHBoxLayout()
+        row.setContentsMargins(16, 10, 12, 10)
+        row.setSpacing(12)
+        text = QVBoxLayout()
+        text.setSpacing(1)
+        text.addWidget(label(title, "rowname"))
+        path = ElidedLabel("", "muted")
+        text.addWidget(path)
+        row.addLayout(text, 1)
+        change = button("Change")
+        change.setAccessibleName(accessible)
+        row.addWidget(change, 0, Qt.AlignVCenter)
+        card.addLayout(row)
+        return path, change
+
+    @staticmethod
+    def _toggle(card: QVBoxLayout, title: str, hint: str) -> QCheckBox:
+        box = QVBoxLayout()
+        box.setContentsMargins(16, 10, 16, 10)
+        box.setSpacing(2)
+        check = QCheckBox(title)
+        check.setFocusPolicy(Qt.TabFocus)
+        box.addWidget(check)
+        h = label(hint, "muted", wrap=True)
+        h.setContentsMargins(26, 0, 0, 0)  # under the text, not the box
+        box.addWidget(h)
+        card.addLayout(box)
+        return check
+
+
 # ---------------------------------------------------------------- window
 
 class MainWindow(QWidget):
@@ -686,32 +839,27 @@ class MainWindow(QWidget):
         title_row = QHBoxLayout()
         title_row.addWidget(label(APP_NAME, "title"))
         title_row.addStretch(1)
-        coffee = button("Buy me a coffee", "coffee")
-        coffee.setIcon(QIcon(svg_pixmap(ICON_CUP, 16)))
-        coffee.setToolTip(f"Sims 4 Mod Test is free. If it helps you, you can support it: {SUPPORT_URL}")
-        coffee.setAccessibleName("Buy me a coffee (opens buymeacoffee.com)")
-        coffee.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(SUPPORT_URL)))
-        title_row.addWidget(coffee, 0, Qt.AlignVCenter)
+        title_row.addWidget(coffee_button(), 0, Qt.AlignVCenter)
         lay.addLayout(title_row)
-        folder_row = QHBoxLayout()
-        folder_row.setSpacing(8)
-        self.folder_label = ElidedLabel("", "muted")
-        folder_row.addWidget(self.folder_label, 1)
-        self.change_btn = button("Change", "link")
-        self.change_btn.setAccessibleName("Choose the Sims 4 folder")
-        self.change_btn.clicked.connect(self.choose_sims_dir)
-        folder_row.addWidget(self.change_btn)
-        lay.addLayout(folder_row)
-        game_row = QHBoxLayout()
-        game_row.setSpacing(8)
-        self.game_label = ElidedLabel("", "muted")
-        game_row.addWidget(self.game_label, 1)
-        self.change_game_btn = button("Change", "link")
-        self.change_game_btn.setAccessibleName("Choose the game folder")
-        self.change_game_btn.clicked.connect(self.choose_game_dir)
-        game_row.addWidget(self.change_game_btn)
-        lay.addLayout(game_row)
         lay.addSpacing(14)
+
+        self.prefs = SettingsPage()
+        p = self.prefs
+        self.folder_label, self.change_btn = p.sims_path, p.change_sims_btn
+        self.game_label, self.change_game_btn = p.game_path, p.change_game_btn
+        self.change_btn.clicked.connect(self.choose_sims_dir)
+        self.change_game_btn.clicked.connect(self.choose_game_dir)
+        self.bind_toggle(p.backup_saves, "backup_saves")
+        self.bind_toggle(p.clear_cache, "clear_cache")
+        self.bind_toggle(p.auto_start, "auto_start_game")
+        self.bind_toggle(p.check_updates, "check_updates")
+        p.check_now_btn.clicked.connect(lambda: self.check_for_update(manual=True))
+        p.project_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(f"https://github.com/{updates.REPO}")))
+        p.data_btn.clicked.connect(lambda: self.open_path(core.DATA_DIR))
+        choice = self.settings.value("appearance", "system", type=str)
+        p.appearance.button({"system": 0, "light": 1, "dark": 2}.get(choice, 0)).setChecked(True)
+        p.appearance.idClicked.connect(self.appearance_changed)
+        self.set_appearance(choice)
 
         self.segments = QFrame()
         self.segments.setObjectName("segments")
@@ -719,7 +867,7 @@ class MainWindow(QWidget):
         sl.setContentsMargins(3, 3, 3, 3)
         sl.setSpacing(2)
         self.mode_group = QButtonGroup(self)
-        for i, text in enumerate(("Test new mods", "Find a broken mod")):
+        for i, text in enumerate(("Test new mods", "Find a broken mod", "Settings")):
             b = button(text, "segment")
             b.setCheckable(True)
             self.mode_group.addButton(b, i)
@@ -745,7 +893,7 @@ class MainWindow(QWidget):
         self.testing = TestingPage()
         self.search = SearchPage()
         self.pages = QStackedWidget()
-        for page in (self.setup, self.search_setup, self.testing, self.search):
+        for page in (self.setup, self.search_setup, self.testing, self.search, self.prefs):
             self.pages.addWidget(page)
         lay.addWidget(self.pages, 1)
 
@@ -766,7 +914,7 @@ class MainWindow(QWidget):
             page.errors.action.setText("Open report")
 
         self.apply_theme()
-        QGuiApplication.styleHints().colorSchemeChanged.connect(lambda _: self.apply_theme())
+        QGuiApplication.styleHints().colorSchemeChanged.connect(lambda _: self.system_scheme_changed())
 
         self.watcher = GameWatcher(self)
         self.watcher.changed.connect(self.game_changed)
@@ -804,14 +952,16 @@ class MainWindow(QWidget):
     def set_sims_dir(self, path: Path | None) -> None:
         self.sims_dir = path
         if path is None:
-            self.folder_label.set_full_text("Sims 4 folder not found")
+            self.folder_label.set_full_text("Not found. Pick the folder that holds Mods and Tray.")
             self.show_current_page()
             self.setup.notice.show_message(
-                "Sims 4 Mod Test could not find your Sims 4 folder. Use Change to pick the folder "
-                "that holds Mods and Tray. It is usually Electronic Arts, The Sims 4 in your Documents.", "warn")
+                "Sims 4 Mod Test could not find your Sims 4 folder. Pick the folder that holds Mods and Tray in "
+                "Settings. It is usually Electronic Arts, The Sims 4 in your Documents.", "warn",
+                "Open Settings", lambda: self.open_tab(2))
             return
+        self.prefs.notice.hide()
         self.settings.setValue("sims_dir", str(path))
-        self.folder_label.set_full_text(f"Sims 4 folder: {path}")
+        self.folder_label.set_full_text(str(path))
         self.setup.notice.hide()
         try:
             core.recover(path)
@@ -833,7 +983,7 @@ class MainWindow(QWidget):
         if path.name.lower() in ("mods", "tray") and core.looks_like_sims_dir(path.parent):
             path = path.parent
         if not core.looks_like_sims_dir(path):
-            self.setup.notice.show_message(
+            self.pages.currentWidget().notice.show_message(
                 f"“{path.name}” doesn’t look like a Sims 4 folder. Pick the folder that holds "
                 "Mods and Tray.", "warn")
             return
@@ -862,14 +1012,14 @@ class MainWindow(QWidget):
         return platforms.find_game_dir()
 
     def set_game_dir(self, path: Path) -> None:
+        self.prefs.notice.hide()
         self.settings.setValue("game_dir", str(path))
         self.show_game_dir()
         self.load_game_index()
 
     def show_game_dir(self) -> None:
         gd = self.game_dir()
-        self.game_label.set_full_text(f"Game folder: {gd}" if gd else
-                                      "Game folder not found. Pick it to check mods against the game’s own files.")
+        self.game_label.set_full_text(str(gd) if gd else "Not found. Pick it to start the game from here.")
 
     def choose_game_dir(self) -> None:
         start = str(self.game_dir() or Path.home())
@@ -895,31 +1045,91 @@ class MainWindow(QWidget):
             self.game_on = running
             self.refresh()
 
-    def play(self) -> None:
+    def play(self, interactive: bool = True) -> None:
         gd = self.game_dir()
+        page = self.pages.currentWidget()
         if gd is None and (platforms.WINDOWS or platforms.MACOS):
+            if not interactive:  # starting by itself must never pop up a dialog
+                page.status.setText("Pick the game folder in Settings to start the game from here.")
+                return
             self.choose_game_dir()
             gd = self.game_dir()
             if gd is None:
                 return
-        page = self.pages.currentWidget()
         if not platforms.launch_game(gd):
-            page.notice.show_message("The Sims 4 did not start. Start it the usual way, or use Change next "
-                                     "to the game folder to pick it.", "error")
+            page.notice.show_message("The Sims 4 did not start. Start it the usual way, or pick the game "
+                                     "folder in Settings.", "error")
             return
         page.status.setText("Starting The Sims 4")
 
-    def check_for_update(self) -> None:
-        """Once a day: is there a newer version on GitHub? Offered calmly; nothing is installed."""
+    # -- settings
+
+    OPTIONS = {"backup_saves": True, "clear_cache": True, "auto_start_game": False, "check_updates": True}
+
+    def opt(self, key: str) -> bool:
+        return self.settings.value(key, self.OPTIONS[key], type=bool)
+
+    def bind_toggle(self, box: QCheckBox, key: str) -> None:
+        box.setChecked(self.opt(key))
+        box.toggled.connect(lambda on: self.settings.setValue(key, on))
+
+    def set_appearance(self, choice: str) -> None:
+        """Light, dark or the system's: Qt switches its own colours (menus, dialogs, title bar) too."""
+        global _appearance
+        _appearance = choice
+        scheme = {"light": Qt.ColorScheme.Light, "dark": Qt.ColorScheme.Dark}.get(choice, Qt.ColorScheme.Unknown)
+        QGuiApplication.styleHints().setColorScheme(scheme)
+
+    def appearance_changed(self, index: int) -> None:
+        choice = ("system", "light", "dark")[index]
+        button = self.prefs.appearance.button(index)
+        if not button.isChecked():
+            button.setChecked(True)  # when called from code rather than a click
+        self.settings.setValue("appearance", choice)
+        self.set_appearance(choice)
+        self.apply_theme()
+
+    def system_scheme_changed(self) -> None:
+        if _appearance == "system":  # a chosen Light/Dark is already applied
+            self.apply_theme()
+
+    def open_tab(self, index: int) -> None:
+        self.mode_group.button(index).setChecked(True)
+        self.mode_changed(index)
+
+    def auto_start_game(self) -> None:
+        if self.opt("auto_start_game") and not self.game_on:
+            self.play(interactive=False)
+
+    def check_for_update(self, manual: bool = False) -> None:
+        """Once a day: is there a newer version on GitHub? Offered calmly; nothing is installed.
+        `manual` is the Check now button: it ignores the daily limit and "Not now"."""
         today = time.strftime("%Y-%m-%d")
-        if self.settings.value("update_checked", "", type=str) == today:
-            return
-        self.settings.setValue("update_checked", today)
-        skipped = self.settings.value("update_skipped", "", type=str)
+        if not manual:
+            if not self.opt("check_updates") or self.settings.value("update_checked", "", type=str) == today:
+                return
+            self.settings.setValue("update_checked", today)
+        skipped = "" if manual else self.settings.value("update_skipped", "", type=str)
+        if manual:
+            self.prefs.version_label.setText("Looking for a new version")
+            self.prefs.check_now_btn.setEnabled(False)
 
         def done(release):
+            if manual:
+                self.prefs.check_now_btn.setEnabled(True)
+                self.prefs.version_label.setText(
+                    f"You have version {__version__}." + ("" if release else " It is the latest one."))
             if release is None:
                 return
+            show(release)
+
+        def failed(_msg: str):
+            if manual:
+                self.prefs.check_now_btn.setEnabled(True)
+                self.prefs.version_label.setText(f"You have version {__version__}. GitHub couldn’t be "
+                                                 "reached, so try again later.")
+
+        def show(release):
 
             def not_now():
                 self.settings.setValue("update_skipped", release.version)
@@ -929,7 +1139,10 @@ class MainWindow(QWidget):
                 f"Sims 4 Mod Test {release.version} is out. You have {__version__}.", "ok",
                 "Download", lambda: QDesktopServices.openUrl(QUrl(release.download)), "Not now", not_now)
 
-        self.run_side(Worker(updates.available_update, skipped), done)
+        if manual:
+            self.run_side(Worker(updates.find_update, skipped), done, on_fail=failed)
+        else:
+            self.run_side(Worker(updates.available_update, skipped), done)
 
     def load_game_index(self) -> None:
         """Read the game's own CAS parts and sliders in the background, for the override check."""
@@ -940,17 +1153,21 @@ class MainWindow(QWidget):
         self.game_keys = None  # until this game's keys are read, nothing is checked against the old ones
 
         def done(keys):
-            if gd != self._index_for:
-                return  # another game folder was picked meanwhile
+            if keys is None or gd != self._index_for:
+                return  # stopped (closing), or another game folder was picked meanwhile
             self.game_keys, self._keys_for = keys, gd
             self.check_items()
 
-        self.run_side(Worker(risks.game_index, gd), done)
+        def build():
+            return risks.game_index(gd, stop=QThread.currentThread().isInterruptionRequested)
+
+        self.run_side(Worker(build), done)
 
     # -- pages
 
     def mode_changed(self, _id: int) -> None:
         self.after.hide()
+        self.prefs.notice.hide()
         self.show_current_page()
 
     def show_current_page(self) -> None:
@@ -958,8 +1175,6 @@ class MainWindow(QWidget):
         running = bool(sims and core.in_test(sims))
         self.state = core.load_state(sims) if running else None
         self.segments.setVisible(not running)
-        self.change_btn.setVisible(not running)
-        self.change_game_btn.setVisible(not running)
         if running and self.state and self.state.get("mode") == "search":
             self.show_search_round()
             self.pages.setCurrentWidget(self.search)
@@ -981,8 +1196,14 @@ class MainWindow(QWidget):
                 self.setup.set_items(items)  # ready for the next round after restoring
         elif self.mode_group.checkedId() == 1:
             self.pages.setCurrentWidget(self.search_setup)
+        elif self.mode_group.checkedId() == 2:
+            self.pages.setCurrentWidget(self.prefs)
         else:
             self.pages.setCurrentWidget(self.setup)
+        self.search_setup.save_warning.text.setText(save_warning(self.opt("backup_saves")))
+        backed_up = bool(self.state and self.state.get("saves"))  # what this test really did
+        for page in (self.testing, self.search):
+            page.save_warning.text.setText(save_warning(backed_up))
         self.setFocus()  # don't leave keyboard focus on a button that was just rebuilt or hidden
         self.check_reports()
         self.refresh()
@@ -1244,11 +1465,14 @@ class MainWindow(QWidget):
         self.worker = None
         self.refresh()
 
-    def run_side(self, worker: Worker, on_ok, touches_sims: bool = False) -> None:
-        """A read-only job (counting, checking); its errors are not worth interrupting for."""
+    def run_side(self, worker: Worker, on_ok, touches_sims: bool = False, on_fail=None) -> None:
+        """A read-only job (counting, checking); its errors are not worth interrupting for,
+        unless the caller asks to hear about them."""
         worker.touches_sims = touches_sims
         self.side_jobs.append(worker)
         worker.succeeded.connect(on_ok)
+        if on_fail:
+            worker.failed.connect(on_fail)
 
         def finished():
             self.side_jobs.remove(worker)
@@ -1262,16 +1486,19 @@ class MainWindow(QWidget):
         s.notice.hide()
         self.after.hide()
         self.saves_notice.hide()
-        s.status.setText("Backing up your saves and copying the test mods")
+        s.status.setText("Backing up your saves and copying the test mods" if self.opt("backup_saves")
+                         else "Copying the test mods")
         s.progress.setRange(0, 100)
         s.progress.setValue(0)
         s.progress.show()
-        worker = Worker(core.start_test, self.sims_dir, list(s.items), True, with_progress=True)
+        worker = Worker(core.start_test, self.sims_dir, list(s.items), self.opt("clear_cache"),
+                        self.opt("backup_saves"), with_progress=True)
         worker.progress.connect(lambda d, t: s.progress.setValue(int(d * 100 / t)))
 
         def ok(_):
             s.progress.hide()
             self.show_current_page()
+            self.auto_start_game()
 
         def fail(msg: str):
             s.progress.hide()
@@ -1285,9 +1512,10 @@ class MainWindow(QWidget):
         ss.notice.hide()
         self.after.hide()
         self.saves_notice.hide()
-        ss.status.setText("Backing up your saves and switching your mods off")
-        self.run_job(Worker(core.start_search, self.sims_dir, True),
-                     lambda _: self.show_current_page(),
+        ss.status.setText("Backing up your saves and switching your mods off" if self.opt("backup_saves")
+                          else "Switching your mods off")
+        self.run_job(Worker(core.start_search, self.sims_dir, self.opt("clear_cache"), self.opt("backup_saves")),
+                     lambda _: (self.show_current_page(), self.auto_start_game()),
                      lambda msg: (ss.notice.show_message(msg, "error"), self.show_current_page()))
 
     def answer(self, still_broken: bool) -> None:
@@ -1296,16 +1524,18 @@ class MainWindow(QWidget):
         se.status.setText("Setting up the next round")
         se.progress.show()
 
-        def ok(_):
+        def ok(state):
             se.progress.hide()
             self.show_current_page()
+            if state and state.get("found") is None and not state.get("not_mods"):
+                self.auto_start_game()  # a new round is ready
 
         def fail(msg: str):
             se.progress.hide()
             se.notice.show_message(msg, "error")
             self.show_current_page()
 
-        self.run_job(Worker(core.answer_search, self.sims_dir, still_broken, True), ok, fail)
+        self.run_job(Worker(core.answer_search, self.sims_dir, still_broken, self.opt("clear_cache")), ok, fail)
 
     def end_test(self, remove_found: bool) -> None:
         page = self.pages.currentWidget()
@@ -1338,7 +1568,7 @@ class MainWindow(QWidget):
             page.notice.show_message(msg, "error")
             self.show_current_page()
 
-        self.run_job(Worker(core.end_test, self.sims_dir, True, remove_found), ok, fail)
+        self.run_job(Worker(core.end_test, self.sims_dir, self.opt("clear_cache"), remove_found), ok, fail)
 
     def offer_saves(self, changed: list[dict]) -> None:
         if not changed:
@@ -1381,10 +1611,9 @@ class MainWindow(QWidget):
             return
         self.watcher.requestInterruption()
         self.watcher.wait(3000)
-        for job in list(self.side_jobs):  # read-only work: safe to stop
-            if not job.wait(300):
-                job.terminate()
-                job.wait(1000)
+        for job in list(self.side_jobs):  # read-only work: ask it to stop, never kill a Python thread
+            job.requestInterruption()
+            job.wait(1000)
         super().closeEvent(e)
 
 
@@ -1423,7 +1652,14 @@ def main() -> int:
     win.show()
     if os.environ.get("SIMS4MODTEST_SMOKE_TEST"):  # CI: the built app starts, shows its window, quits
         QTimer.singleShot(3000, win.close)
-    return app.exec()
+    code = app.exec()
+    if win.watcher.isRunning() or any(job.isRunning() for job in win.side_jobs):
+        win.settings.sync()
+        lock.unlock()
+        # A read-only check (game index, update check) is still finishing. Python would wait for it
+        # or abort over a running QThread; nothing it does needs saving, so leave right away.
+        os._exit(code)
+    return code
 
 
 if __name__ == "__main__":

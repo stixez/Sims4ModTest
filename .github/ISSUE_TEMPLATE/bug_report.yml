@@ -24,7 +24,7 @@ body:
     attributes:
       label: Sims 4 Mod Test version
       description: Shown in Settings, under Updates.
-      placeholder: "1.0.0"
+      placeholder: "1.1.0"
   - type: input
     id: game
     attributes:

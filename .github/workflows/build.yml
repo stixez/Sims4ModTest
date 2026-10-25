@@ -86,7 +86,11 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Checksums
+        working-directory: artifacts
+        run: sha256sum Sims-4-Mod-Test-* > SHA256SUMS.txt && cat SHA256SUMS.txt
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: artifacts/*
+          fail_on_unmatched_files: true
           generate_release_notes: true

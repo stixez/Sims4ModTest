@@ -1,0 +1,15 @@
+# Monthly pull requests when a pinned action or package has a new version. A package update also
+# needs its version changed in THIRD-PARTY-NOTICES.md.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      python-packages:
+        patterns: ["*"]

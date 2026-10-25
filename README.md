@@ -59,11 +59,14 @@ moves the broken mod to `Mods removed by Sims 4 Mod Test`, so nothing is lost.
 
 ## Build it yourself
 
+You need Python 3.12.
+
 ```
 python -m venv .venv
-.venv/Scripts/pip install -r requirements-dev.txt      # macOS/Linux: .venv/bin/pip
-python -m pytest -q tests
-python packaging/build.py
+.venv/Scripts/python -m pip install -r requirements-dev.txt    # macOS/Linux: .venv/bin/python
+.venv/Scripts/python app.py                                    # run it from source
+.venv/Scripts/python -m pytest -q tests
+.venv/Scripts/python packaging/build.py                        # the downloads, in dist/
 ```
 
 The Windows installer needs [Inno Setup 6](https://jrsoftware.org/isinfo.php).

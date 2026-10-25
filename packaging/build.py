@@ -28,6 +28,8 @@ DIST = ROOT / "dist"
 EXCLUDE = ["PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.QtQml", "PySide6.QtQuick",
            "PySide6.QtMultimedia", "PySide6.QtNetwork", "PySide6.QtPdf", "PySide6.QtSql", "PySide6.QtTest",
            "PySide6.QtDesigner", "tkinter"]
+# Qt image plugins for formats the app never opens (its own images are SVG and PNG, which don't need these).
+UNUSED_IMAGE_FORMATS = {"qgif", "qicns", "qjpeg", "qtga", "qtiff", "qwbmp", "qwebp"}
 
 
 def version_file(path: Path) -> Path:
@@ -75,6 +77,46 @@ def build_app() -> None:
     PyInstaller.__main__.run(args)
 
 
+def drop_unused_plugins() -> None:
+    """Less to download and to credit. Not on macOS: changing the .app after PyInstaller signed it
+    would break its signature."""
+    if sys.platform == "darwin":
+        return
+    for plugin in (DIST / NAME / "_internal").glob("PySide6/**/imageformats/*"):
+        if plugin.stem.removeprefix("lib") in UNUSED_IMAGE_FORMATS:
+            plugin.unlink()
+
+
+def collect_linux_notices() -> None:
+    """The Linux download carries system libraries from the build machine (Ubuntu). Copy each one's
+    copyright file and write down its package and version, so its exact source can be fetched."""
+    internal = DIST / NAME / "_internal"
+    out = internal / "licenses" / "linux-system-libraries"
+    out.mkdir(parents=True, exist_ok=True)
+    packages: dict[str, list[str]] = {}
+    for lib in sorted(internal.glob("*.so*")):
+        found = subprocess.run(["dpkg-query", "-S", f"*/{lib.name}"], capture_output=True, text=True)
+        for line in found.stdout.splitlines():
+            owners, _, path = line.partition(": ")
+            if path.endswith(f"/x86_64-linux-gnu/{lib.name}") and not line.startswith("diversion"):
+                packages.setdefault(owners.split(",")[0].strip(), []).append(lib.name)
+                break
+        # not found: it came with PySide6 or Python, which THIRD-PARTY-NOTICES.md covers
+    rows = []
+    for package, libs in sorted(packages.items()):
+        name = package.split(":")[0]
+        copyright_file = Path("/usr/share/doc") / name / "copyright"
+        if not copyright_file.is_file():
+            raise SystemExit(f"No copyright file for {package} ({', '.join(libs)}) at {copyright_file}")
+        shutil.copyfile(copyright_file, out / f"{name}.txt")
+        info = subprocess.run(["dpkg-query", "-W", "-f", "${Version}\t${source:Package}", package],
+                              capture_output=True, text=True, check=True).stdout
+        rows.append(f"{name}\t{info}\t{' '.join(libs)}")
+    (out / "packages.txt").write_text(
+        "Ubuntu packages whose libraries are in this download, unmodified.\n"
+        "package\tversion\tsource package\tlibraries\n" + "\n".join(rows) + "\n", encoding="utf-8")
+
+
 def find_iscc() -> Path | None:
     candidates = [os.environ.get("ISCC"), shutil.which("ISCC")]
     for base in (os.environ.get("LOCALAPPDATA"), os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")):
@@ -107,6 +149,9 @@ def package() -> list[Path]:
 
 def main() -> int:
     build_app()
+    drop_unused_plugins()
+    if sys.platform.startswith("linux"):
+        collect_linux_notices()
     for path in package():
         print(f"Built {path}")
     return 0
